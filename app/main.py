@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import FastAPI, Request
 from google.oauth2 import service_account
@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 # --- CONFIGURAÇÕES ---
 load_dotenv()
-app = FastAPI(title="Agente Diario", version="0.7.0 (Audio)")
+app = FastAPI(title="Agente Diario", version="0.8.0 (Full Vision)")
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -24,61 +24,47 @@ if GEMINI_KEY:
 def get_current_date_prompt():
     now = datetime.now()
     return f"""
-    Data atual: {now.strftime("%Y-%m-%d %H:%M")}.
-    Instrução: Analise o input (texto ou audio).
+    Data e Hora atual: {now.strftime("%Y-%m-%d %H:%M")}.
+    Analise o pedido do usuário (texto ou audio).
     
-    Se for agendar, responda APENAS JSON:
-    {{ "intent": "agendar_reuniao", "title": "Titulo", "start_iso": "YYYY-MM-DDTHH:MM:SS", "end_iso": "YYYY-MM-DDTHH:MM:SS", "description": "Detalhes" }}
+    1. Se for AGENDAR, retorne JSON:
+    {{ "intent": "agendar", "title": "Titulo", "start_iso": "YYYY-MM-DDTHH:MM:SS", "end_iso": "YYYY-MM-DDTHH:MM:SS", "description": "Detalhes" }}
     
-    Se for conversa, responda APENAS JSON:
+    2. Se for CONSULTAR/LER agenda (ex: "o que tenho hoje?", "estou livre amanhã?"), retorne JSON calculando o intervalo de tempo pedido:
+    {{ "intent": "consultar", "time_min": "YYYY-MM-DDTHH:MM:SS", "time_max": "YYYY-MM-DDTHH:MM:SS" }}
+    (Dica: Para 'hoje', time_min é agora e time_max é final do dia. Para 'amanhã', o dia todo).
+    
+    3. Se for CONVERSA genérica, retorne JSON:
     {{ "intent": "conversa", "response": "Sua resposta curta" }}
     """
 
-def ask_gemini_text(text: str):
+def ask_gemini_generic(content_input):
+    """Função única para Texto ou Áudio"""
     if not GEMINI_KEY: return None
     model = genai.GenerativeModel("gemini-2.0-flash")
-    prompt = get_current_date_prompt() + f'\nUsuario disse: "{text}"'
+    prompt = get_current_date_prompt()
     
     try:
-        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        # Se for lista (audio + prompt), passa direto. Se for string (texto), cria lista.
+        parts = [content_input, prompt] if not isinstance(content_input, list) else content_input + [prompt]
+        
+        response = model.generate_content(parts, generation_config={"response_mime_type": "application/json"})
         return json.loads(response.text)
     except Exception as e:
-        print(f"❌ Erro IA Texto: {e}")
-        return None
-
-def ask_gemini_audio(file_path: str):
-    if not GEMINI_KEY: return None
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    
-    # Upload do arquivo para o Google AI
-    audio_file = genai.upload_file(file_path, mime_type="audio/ogg")
-    
-    prompt = get_current_date_prompt() + "\nO usuário enviou este áudio. Extraia a intenção dele."
-    
-    try:
-        # Envia o áudio + prompt juntos
-        response = model.generate_content([audio_file, prompt], generation_config={"response_mime_type": "application/json"})
-        return json.loads(response.text)
-    except Exception as e:
-        print(f"❌ Erro IA Audio: {e}")
+        print(f"❌ Erro IA: {e}")
         return None
 
 def download_telegram_voice(file_id: str):
-    # 1. Pega o caminho do arquivo
     r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}")
     file_path_info = r.json().get("result", {}).get("file_path")
-    
     if not file_path_info: return None
     
-    # 2. Baixa o binário
     download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path_info}"
     voice_data = requests.get(download_url).content
     
-    # 3. Salva no /tmp (pasta temporária do Vercel)
     local_path = "/tmp/voice.ogg"
     with open(local_path, "wb") as f:
         f.write(voice_data)
-        
     return local_path
 
 # --- CALENDAR SERVICE ---
@@ -112,8 +98,39 @@ class GoogleCalendarService:
             evt = service.events().insert(calendarId=self.calendar_id, body=body).execute()
             return evt.get('id')
         except Exception as e:
-            print(f"❌ Erro Calendar: {e}")
+            print(f"❌ Erro Calendar Create: {e}")
             return None
+
+    def list_events(self, time_min, time_max):
+        if not self.creds: return "Erro de credenciais."
+        service = build('calendar', 'v3', credentials=self.creds)
+        
+        # Garante fuso horário UTC (o Z no final) para a busca funcionar bem
+        if not time_min.endswith("Z"): time_min += "-03:00" # Ajuste básico BR
+        if not time_max.endswith("Z"): time_max += "-03:00"
+
+        try:
+            events_result = service.events().list(
+                calendarId=self.calendar_id, 
+                timeMin=time_min, timeMax=time_max,
+                singleEvents=True, orderBy='startTime'
+            ).execute()
+            events = events_result.get('items', [])
+
+            if not events:
+                return "📅 Nada agendado para esse período."
+
+            msg = "📅 **Sua Agenda:**\n"
+            for event in events:
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                # Formatação simples da hora (pega T10:00:00...)
+                hora = start[11:16] if 'T' in start else "Dia todo"
+                msg += f"• {hora} - {event['summary']}\n"
+            return msg
+
+        except Exception as e:
+            print(f"❌ Erro Calendar List: {e}")
+            return "Erro ao ler agenda."
 
 def send_telegram(chat_id, text):
     if TELEGRAM_TOKEN:
@@ -122,7 +139,7 @@ def send_telegram(chat_id, text):
 # --- ROTAS ---
 @app.get("/")
 def home():
-    return {"status": "Agente com Ouvidos Ativo 👂"}
+    return {"status": "Agente Completo Online 👁️👂🤚"}
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
@@ -136,32 +153,39 @@ async def telegram_webhook(request: Request):
     chat_id = data["message"]["chat"]["id"]
     ai_response = None
 
-    # 1. PROCESSAR TEXTO
+    # 1. ENTRADA (Texto ou Voz)
     if "text" in data["message"]:
         text = data["message"]["text"]
         print(f"📩 Texto: {text}")
-        ai_response = ask_gemini_text(text)
+        ai_response = ask_gemini_generic(text)
 
-    # 2. PROCESSAR ÁUDIO (VOICE)
     elif "voice" in data["message"]:
         print("🎙️ Áudio recebido...")
         file_id = data["message"]["voice"]["file_id"]
         audio_path = download_telegram_voice(file_id)
-        
         if audio_path:
             send_telegram(chat_id, "🎧 Ouvindo...")
-            ai_response = ask_gemini_audio(audio_path)
-        else:
-            send_telegram(chat_id, "❌ Erro ao baixar audio.")
+            # Upload do arquivo para Gemini
+            myfile = genai.upload_file(audio_path, mime_type="audio/ogg")
+            ai_response = ask_gemini_generic([myfile])
 
-    # 3. EXECUTAR AÇÃO
+    # 2. AÇÃO
     if ai_response:
-        if ai_response.get("intent") == "agendar_reuniao":
-            cal = GoogleCalendarService()
+        intent = ai_response.get("intent")
+        cal = GoogleCalendarService()
+
+        if intent == "agendar":
             if cal.create_event(ai_response["title"], ai_response["start_iso"], ai_response["end_iso"], ai_response.get("description")):
-                send_telegram(chat_id, f"✅ Agendado via voz: {ai_response['title']}")
+                send_telegram(chat_id, f"✅ Agendado: {ai_response['title']}")
             else:
-                send_telegram(chat_id, "❌ Entendi o áudio, mas falhei na agenda.")
+                send_telegram(chat_id, "❌ Falha ao agendar.")
+        
+        elif intent == "consultar":
+            # O Gemini calculou as datas, agora o Python busca
+            send_telegram(chat_id, "🔍 Verificando sua agenda...")
+            agenda_texto = cal.list_events(ai_response["time_min"], ai_response["time_max"])
+            send_telegram(chat_id, agenda_texto)
+            
         elif "response" in ai_response:
             send_telegram(chat_id, ai_response["response"])
             
