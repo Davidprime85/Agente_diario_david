@@ -23,19 +23,31 @@ if GEMINI_KEY:
 # --- FUNÇÕES AUXILIARES ---
 def get_current_date_prompt():
     now = datetime.now()
+    # Força o nome do dia em Português para ajudar o Gemini
+    dias = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
+    dia_semana = dias[now.weekday()]
+    
+    # Ex: "2026-01-20 17:30 (Terça)"
+    data_formatada = f"{now.strftime('%Y-%m-%d %H:%M')} ({dia_semana})"
+    
     return f"""
-    Data e Hora atual: {now.strftime("%Y-%m-%d %H:%M")}.
-    Analise o pedido do usuário (texto ou audio).
+    Data e Hora atual: {data_formatada}.
+    
+    Instrução: Você é uma assistente pessoal eficiente. Analise o pedido (texto/audio).
     
     1. Se for AGENDAR, retorne JSON:
     {{ "intent": "agendar", "title": "Titulo", "start_iso": "YYYY-MM-DDTHH:MM:SS", "end_iso": "YYYY-MM-DDTHH:MM:SS", "description": "Detalhes" }}
     
-    2. Se for CONSULTAR/LER agenda (ex: "o que tenho hoje?", "estou livre amanhã?"), retorne JSON calculando o intervalo de tempo pedido:
+    2. Se for CONSULTAR/LER agenda (ex: "o que tenho domingo?", "estou livre amanhã?"), retorne JSON.
+    IMPORTANTE: Calcule a data futura corretamente baseada no dia da semana atual ({dia_semana}).
+    - Para "hoje": time_min = agora, time_max = 23:59 de hoje.
+    - Para dias inteiros (ex: "domingo", "amanhã"): time_min = 00:00 do dia alvo, time_max = 23:59 do dia alvo.
+    
+    JSON de consulta:
     {{ "intent": "consultar", "time_min": "YYYY-MM-DDTHH:MM:SS", "time_max": "YYYY-MM-DDTHH:MM:SS" }}
-    (Dica: Para 'hoje', time_min é agora e time_max é final do dia. Para 'amanhã', o dia todo).
     
     3. Se for CONVERSA genérica, retorne JSON:
-    {{ "intent": "conversa", "response": "Sua resposta curta" }}
+    {{ "intent": "conversa", "response": "Sua resposta curta e simpática" }}
     """
 
 def ask_gemini_generic(content_input):
