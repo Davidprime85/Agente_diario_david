@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+firebase-key.json
+*.pyc
+.env
+ngrok.exe
