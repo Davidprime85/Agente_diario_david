@@ -1,204 +1,219 @@
 import os
 import json
 import requests
-from datetime import datetime, timedelta
-from typing import Optional
+from datetime import datetime
+from typing import Optional, List
 from fastapi import FastAPI, Request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from google.cloud import firestore # <--- Nova biblioteca
 import google.generativeai as genai
 from dotenv import load_dotenv
 
 # --- CONFIGURAÇÕES ---
 load_dotenv()
-app = FastAPI(title="Agente Diario", version="0.8.0 (Full Vision)")
+app = FastAPI(title="Agente Jarvis", version="1.0.0 (Memory)")
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID")
 
+# --- CONEXÃO COM BANCO DE DADOS (FIRESTORE) ---
+def get_firestore_client():
+    firebase_env = os.environ.get("FIREBASE_CREDENTIALS")
+    creds = None
+    
+    if firebase_env:
+        # Nuvem (Vercel)
+        cred_info = json.loads(firebase_env)
+        creds = service_account.Credentials.from_service_account_info(cred_info)
+    else:
+        # Local (PC)
+        key_path = "firebase-key.json"
+        if os.path.exists(key_path):
+            creds = service_account.Credentials.from_service_account_file(key_path)
+            
+    if creds:
+        return firestore.Client(credentials=creds)
+    return None
+
+# --- GERENCIAMENTO DE MEMÓRIA ---
+def get_chat_history(chat_id, limit=5):
+    """Busca as últimas mensagens do banco para dar contexto"""
+    db = get_firestore_client()
+    if not db: return ""
+    
+    # Acessa a coleção 'chats', documento do usuário, subcoleção 'mensagens'
+    # Ordena por data decrescente (mais recentes) e pega 'limit'
+    docs = db.collection('chats').document(str(chat_id)).collection('mensagens')\
+             .order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limit).stream()
+    
+    history_list = []
+    for doc in docs:
+        data = doc.to_dict()
+        history_list.append(f"{data['role']}: {data['content']}")
+    
+    # Inverte para ficar na ordem cronológica (Antiga -> Nova)
+    return "\n".join(reversed(history_list))
+
+def save_chat_message(chat_id, role, content):
+    """Salva uma mensagem no banco"""
+    db = get_firestore_client()
+    if not db: return
+    
+    data = {
+        "role": role, # 'user' ou 'model'
+        "content": content,
+        "timestamp": datetime.now()
+    }
+    # Salva na subcoleção 'mensagens'
+    db.collection('chats').document(str(chat_id)).collection('mensagens').add(data)
+
+# --- GEMINI CÉREBRO ---
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
-# --- FUNÇÕES AUXILIARES ---
-def get_current_date_prompt():
+def get_system_prompt():
     now = datetime.now()
-    # Força o nome do dia em Português para ajudar o Gemini
     dias = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
     dia_semana = dias[now.weekday()]
-    
-    # Ex: "2026-01-20 17:30 (Terça)"
     data_formatada = f"{now.strftime('%Y-%m-%d %H:%M')} ({dia_semana})"
     
     return f"""
-    Data e Hora atual: {data_formatada}.
+    SYSTEM: Você é um Assistente Pessoal Inteligente.
+    Data atual: {data_formatada}.
     
-    Instrução: Você é uma assistente pessoal eficiente. Analise o pedido (texto/audio).
-    
-    1. Se for AGENDAR, retorne JSON:
-    {{ "intent": "agendar", "title": "Titulo", "start_iso": "YYYY-MM-DDTHH:MM:SS", "end_iso": "YYYY-MM-DDTHH:MM:SS", "description": "Detalhes" }}
-    
-    2. Se for CONSULTAR/LER agenda (ex: "o que tenho domingo?", "estou livre amanhã?"), retorne JSON.
-    IMPORTANTE: Calcule a data futura corretamente baseada no dia da semana atual ({dia_semana}).
-    - Para "hoje": time_min = agora, time_max = 23:59 de hoje.
-    - Para dias inteiros (ex: "domingo", "amanhã"): time_min = 00:00 do dia alvo, time_max = 23:59 do dia alvo.
-    
-    JSON de consulta:
-    {{ "intent": "consultar", "time_min": "YYYY-MM-DDTHH:MM:SS", "time_max": "YYYY-MM-DDTHH:MM:SS" }}
-    
-    3. Se for CONVERSA genérica, retorne JSON:
-    {{ "intent": "conversa", "response": "Sua resposta curta e simpática" }}
+    REGRAS:
+    1. Use o HISTÓRICO DE CONVERSA abaixo para lembrar do contexto (nome do usuário, assuntos anteriores).
+    2. Se for AGENDAR: Retorne JSON {{ "intent": "agendar", "title": "...", "start_iso": "...", "end_iso": "..." }}
+    3. Se for LER AGENDA: Retorne JSON {{ "intent": "consultar", "time_min": "...", "time_max": "..." }}
+    4. Se for CONVERSA: Retorne JSON {{ "intent": "conversa", "response": "..." }}
     """
 
-def ask_gemini_generic(content_input):
-    """Função única para Texto ou Áudio"""
+def ask_gemini(text_input, chat_id, is_audio=False):
     if not GEMINI_KEY: return None
+    
+    # 1. Busca memória
+    history = get_chat_history(chat_id)
+    
+    # 2. Monta o prompt com memória
+    system_instruction = get_system_prompt()
+    full_prompt = f"{system_instruction}\n\nHISTÓRICO RECENTE:\n{history}\n\nUSUÁRIO ATUAL:\n{text_input}"
+    
     model = genai.GenerativeModel("gemini-2.0-flash")
-    prompt = get_current_date_prompt()
     
     try:
-        # Se for lista (audio + prompt), passa direto. Se for string (texto), cria lista.
-        parts = [content_input, prompt] if not isinstance(content_input, list) else content_input + [prompt]
+        # Se for áudio, precisamos mandar o arquivo + prompt de texto
+        content = [text_input, full_prompt] if is_audio else full_prompt
         
-        response = model.generate_content(parts, generation_config={"response_mime_type": "application/json"})
-        return json.loads(response.text)
+        response = model.generate_content(content, generation_config={"response_mime_type": "application/json"})
+        result = json.loads(response.text)
+        
+        # Salva o que o usuário disse
+        user_msg = "[Audio Enviado]" if is_audio else text_input
+        save_chat_message(chat_id, "user", str(user_msg))
+        
+        # Salva o que a IA respondeu (se for conversa simples)
+        if result.get("intent") == "conversa":
+            save_chat_message(chat_id, "model", result["response"])
+        elif result.get("intent") == "agendar":
+            save_chat_message(chat_id, "model", f"Agendei: {result.get('title')}")
+            
+        return result
     except Exception as e:
         print(f"❌ Erro IA: {e}")
         return None
 
-def download_telegram_voice(file_id: str):
+# --- CALENDAR & TOOLS ---
+def download_telegram_voice(file_id):
     r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}")
-    file_path_info = r.json().get("result", {}).get("file_path")
-    if not file_path_info: return None
+    file_path = r.json().get("result", {}).get("file_path")
+    if not file_path: return None
     
-    download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path_info}"
-    voice_data = requests.get(download_url).content
-    
+    file_content = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}").content
     local_path = "/tmp/voice.ogg"
-    with open(local_path, "wb") as f:
-        f.write(voice_data)
+    with open(local_path, "wb") as f: f.write(file_content)
     return local_path
 
-# --- CALENDAR SERVICE ---
-class GoogleCalendarService:
+class CalendarService:
     def __init__(self):
         self.creds = None
         self.calendar_id = CALENDAR_ID
-        firebase_env = os.environ.get("FIREBASE_CREDENTIALS")
-        
-        if firebase_env:
-            cred_info = json.loads(firebase_env)
-            self.creds = service_account.Credentials.from_service_account_info(
-                cred_info, scopes=['https://www.googleapis.com/auth/calendar']
-            )
-        else:
-            key_path = "firebase-key.json"
-            if os.path.exists(key_path):
-                self.creds = service_account.Credentials.from_service_account_file(
-                    key_path, scopes=['https://www.googleapis.com/auth/calendar']
-                )
+        env_creds = os.environ.get("FIREBASE_CREDENTIALS")
+        if env_creds:
+            self.creds = service_account.Credentials.from_service_account_info(json.loads(env_creds), scopes=['https://www.googleapis.com/auth/calendar'])
+        elif os.path.exists("firebase-key.json"):
+            self.creds = service_account.Credentials.from_service_account_file("firebase-key.json", scopes=['https://www.googleapis.com/auth/calendar'])
 
-    def create_event(self, title, start, end, desc=""):
-        if not self.creds: return None
-        service = build('calendar', 'v3', credentials=self.creds)
-        body = {
-            'summary': title, 'description': desc,
-            'start': {'dateTime': start, 'timeZone': 'America/Sao_Paulo'},
-            'end': {'dateTime': end, 'timeZone': 'America/Sao_Paulo'}
-        }
-        try:
-            evt = service.events().insert(calendarId=self.calendar_id, body=body).execute()
-            return evt.get('id')
-        except Exception as e:
-            print(f"❌ Erro Calendar Create: {e}")
-            return None
-
-    def list_events(self, time_min, time_max):
-        if not self.creds: return "Erro de credenciais."
+    def execute(self, action, data):
+        if not self.creds: return "Erro de credenciais"
         service = build('calendar', 'v3', credentials=self.creds)
         
-        # Garante fuso horário UTC (o Z no final) para a busca funcionar bem
-        if not time_min.endswith("Z"): time_min += "-03:00" # Ajuste básico BR
-        if not time_max.endswith("Z"): time_max += "-03:00"
-
-        try:
-            events_result = service.events().list(
-                calendarId=self.calendar_id, 
-                timeMin=time_min, timeMax=time_max,
-                singleEvents=True, orderBy='startTime'
-            ).execute()
-            events = events_result.get('items', [])
-
-            if not events:
-                return "📅 Nada agendado para esse período."
-
-            msg = "📅 **Sua Agenda:**\n"
-            for event in events:
-                start = event['start'].get('dateTime', event['start'].get('date'))
-                # Formatação simples da hora (pega T10:00:00...)
+        if action == "create":
+            body = {
+                'summary': data['title'], 'description': data.get('description', ''),
+                'start': {'dateTime': data['start_iso'], 'timeZone': 'America/Sao_Paulo'},
+                'end': {'dateTime': data['end_iso'], 'timeZone': 'America/Sao_Paulo'}
+            }
+            service.events().insert(calendarId=self.calendar_id, body=body).execute()
+            return True
+            
+        elif action == "list":
+            tmin, tmax = data['time_min'], data['time_max']
+            if not tmin.endswith("Z"): tmin += "-03:00"
+            if not tmax.endswith("Z"): tmax += "-03:00"
+            events = service.events().list(calendarId=self.calendar_id, timeMin=tmin, timeMax=tmax, singleEvents=True, orderBy='startTime').execute().get('items', [])
+            if not events: return "📅 Nada agendado."
+            msg = "📅 **Agenda:**\n"
+            for e in events:
+                start = e['start'].get('dateTime', e['start'].get('date'))
                 hora = start[11:16] if 'T' in start else "Dia todo"
-                msg += f"• {hora} - {event['summary']}\n"
+                msg += f"• {hora} - {e['summary']}\n"
             return msg
-
-        except Exception as e:
-            print(f"❌ Erro Calendar List: {e}")
-            return "Erro ao ler agenda."
-
-def send_telegram(chat_id, text):
-    if TELEGRAM_TOKEN:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text})
+        return False
 
 # --- ROTAS ---
-@app.get("/")
-def home():
-    return {"status": "Agente Completo Online 👁️👂🤚"}
-
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    try:
-        data = await request.json()
-    except:
-        return {"status": "error"}
-
-    if "message" not in data: return {"status": "ok"}
+    try: data = await request.json()
+    except: return "error"
     
-    chat_id = data["message"]["chat"]["id"]
-    ai_response = None
+    if "message" not in data: return "ok"
+    msg = data["message"]
+    chat_id = msg["chat"]["id"]
+    
+    ai_resp = None
+    
+    # 1. Processa Entrada
+    if "text" in msg:
+        print(f"📩 Texto: {msg['text']}")
+        ai_resp = ask_gemini(msg['text'], chat_id, is_audio=False)
+    elif "voice" in msg:
+        print("🎙️ Voz recebida")
+        path = download_telegram_voice(msg["voice"]["file_id"])
+        if path:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "🎧 Ouvindo..."})
+            myfile = genai.upload_file(path, mime_type="audio/ogg")
+            ai_resp = ask_gemini(myfile, chat_id, is_audio=True)
 
-    # 1. ENTRADA (Texto ou Voz)
-    if "text" in data["message"]:
-        text = data["message"]["text"]
-        print(f"📩 Texto: {text}")
-        ai_response = ask_gemini_generic(text)
-
-    elif "voice" in data["message"]:
-        print("🎙️ Áudio recebido...")
-        file_id = data["message"]["voice"]["file_id"]
-        audio_path = download_telegram_voice(file_id)
-        if audio_path:
-            send_telegram(chat_id, "🎧 Ouvindo...")
-            # Upload do arquivo para Gemini
-            myfile = genai.upload_file(audio_path, mime_type="audio/ogg")
-            ai_response = ask_gemini_generic([myfile])
-
-    # 2. AÇÃO
-    if ai_response:
-        intent = ai_response.get("intent")
-        cal = GoogleCalendarService()
-
-        if intent == "agendar":
-            if cal.create_event(ai_response["title"], ai_response["start_iso"], ai_response["end_iso"], ai_response.get("description")):
-                send_telegram(chat_id, f"✅ Agendado: {ai_response['title']}")
-            else:
-                send_telegram(chat_id, "❌ Falha ao agendar.")
+    # 2. Executa Ação
+    if ai_resp:
+        intent = ai_resp.get("intent")
+        cal = CalendarService()
         
+        if intent == "conversa":
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": ai_resp["response"]})
+            
+        elif intent == "agendar":
+            if cal.execute("create", ai_resp):
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"✅ Agendado: {ai_resp['title']}"})
+            else:
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "❌ Falha ao agendar."})
+                
         elif intent == "consultar":
-            # O Gemini calculou as datas, agora o Python busca
-            send_telegram(chat_id, "🔍 Verificando sua agenda...")
-            agenda_texto = cal.list_events(ai_response["time_min"], ai_response["time_max"])
-            send_telegram(chat_id, agenda_texto)
-            
-        elif "response" in ai_response:
-            send_telegram(chat_id, ai_response["response"])
-            
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "🔍 Consultando..."})
+            resp = cal.execute("list", ai_resp)
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": resp})
+            save_chat_message(chat_id, "model", resp) # Salva o que a IA leu da agenda
+
     return {"status": "ok"}
