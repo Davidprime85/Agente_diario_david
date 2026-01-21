@@ -6,13 +6,13 @@ from typing import Optional, List
 from fastapi import FastAPI, Request
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from google.cloud import firestore # <--- Nova biblioteca
+from google.cloud import firestore
 import google.generativeai as genai
 from dotenv import load_dotenv
 
 # --- CONFIGURAÇÕES ---
 load_dotenv()
-app = FastAPI(title="Agente Jarvis", version="1.0.0 (Memory)")
+app = FastAPI(title="Agente Jarvis", version="2.0.0 (Tasks)")
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -22,114 +22,129 @@ CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID")
 def get_firestore_client():
     firebase_env = os.environ.get("FIREBASE_CREDENTIALS")
     creds = None
-    
     if firebase_env:
-        # Nuvem (Vercel)
         cred_info = json.loads(firebase_env)
         creds = service_account.Credentials.from_service_account_info(cred_info)
     else:
-        # Local (PC)
         key_path = "firebase-key.json"
         if os.path.exists(key_path):
             creds = service_account.Credentials.from_service_account_file(key_path)
-            
-    if creds:
-        return firestore.Client(credentials=creds)
-    return None
+    return firestore.Client(credentials=creds) if creds else None
 
-# --- GERENCIAMENTO DE MEMÓRIA ---
+# --- GERENCIAMENTO DE MEMÓRIA (CHAT) ---
 def get_chat_history(chat_id, limit=5):
-    """Busca as últimas mensagens do banco para dar contexto"""
     db = get_firestore_client()
     if not db: return ""
-    
-    # Acessa a coleção 'chats', documento do usuário, subcoleção 'mensagens'
-    # Ordena por data decrescente (mais recentes) e pega 'limit'
     docs = db.collection('chats').document(str(chat_id)).collection('mensagens')\
              .order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limit).stream()
-    
-    history_list = []
-    for doc in docs:
-        data = doc.to_dict()
-        history_list.append(f"{data['role']}: {data['content']}")
-    
-    # Inverte para ficar na ordem cronológica (Antiga -> Nova)
+    history_list = [f"{doc.to_dict()['role']}: {doc.to_dict()['content']}" for doc in docs]
     return "\n".join(reversed(history_list))
 
 def save_chat_message(chat_id, role, content):
-    """Salva uma mensagem no banco"""
     db = get_firestore_client()
-    if not db: return
-    
-    data = {
-        "role": role, # 'user' ou 'model'
-        "content": content,
-        "timestamp": datetime.now()
-    }
-    # Salva na subcoleção 'mensagens'
-    db.collection('chats').document(str(chat_id)).collection('mensagens').add(data)
+    if db:
+        db.collection('chats').document(str(chat_id)).collection('mensagens').add({
+            "role": role, "content": content, "timestamp": datetime.now()
+        })
+
+# --- GERENCIAMENTO DE TAREFAS (NOVO) ---
+class TaskService:
+    def __init__(self, chat_id):
+        self.db = get_firestore_client()
+        self.chat_id = str(chat_id)
+
+    def add_task(self, item):
+        if not self.db: return False
+        # Salva na coleção 'tasks' dentro do documento do usuário
+        self.db.collection('chats').document(self.chat_id).collection('tasks').add({
+            "item": item,
+            "status": "pendente",
+            "created_at": datetime.now()
+        })
+        return True
+
+    def list_tasks(self):
+        if not self.db: return "Erro no banco."
+        docs = self.db.collection('chats').document(self.chat_id).collection('tasks')\
+                 .where(filter=firestore.FieldFilter("status", "==", "pendente")).stream()
+        
+        tasks = [doc.to_dict()['item'] for doc in docs]
+        if not tasks: return "✅ Nenhuma tarefa pendente!"
+        
+        msg = "📝 **Suas Pendências:**\n"
+        for t in tasks: msg += f"• {t}\n"
+        return msg
+
+    def complete_task(self, item_name):
+        if not self.db: return False
+        # Busca tarefa pelo nome (aproximado) para marcar como feita
+        docs = self.db.collection('chats').document(self.chat_id).collection('tasks')\
+                 .where(filter=firestore.FieldFilter("status", "==", "pendente")).stream()
+        
+        found = False
+        for doc in docs:
+            data = doc.to_dict()
+            if item_name.lower() in data['item'].lower():
+                doc.reference.update({"status": "concluido"})
+                found = True
+        return found
 
 # --- GEMINI CÉREBRO ---
-if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
+if GEMINI_KEY: genai.configure(api_key=GEMINI_KEY)
 
 def get_system_prompt():
     now = datetime.now()
     dias = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
     dia_semana = dias[now.weekday()]
-    data_formatada = f"{now.strftime('%Y-%m-%d %H:%M')} ({dia_semana})"
-    
     return f"""
-    SYSTEM: Você é um Assistente Pessoal Inteligente.
-    Data atual: {data_formatada}.
+    SYSTEM: Você é o Jarvis, um assistente pessoal eficiente.
+    Data: {now.strftime('%Y-%m-%d %H:%M')} ({dia_semana}).
     
-    REGRAS:
-    1. Use o HISTÓRICO DE CONVERSA abaixo para lembrar do contexto (nome do usuário, assuntos anteriores).
-    2. Se for AGENDAR: Retorne JSON {{ "intent": "agendar", "title": "...", "start_iso": "...", "end_iso": "..." }}
-    3. Se for LER AGENDA: Retorne JSON {{ "intent": "consultar", "time_min": "...", "time_max": "..." }}
-    4. Se for CONVERSA: Retorne JSON {{ "intent": "conversa", "response": "..." }}
+    INTENÇÕES POSSÍVEIS (Retorne APENAS JSON):
+    
+    1. AGENDAR (Google Calendar):
+    {{ "intent": "agendar", "title": "Titulo", "start_iso": "YYYY-MM-DDTHH:MM:SS", "end_iso": "YYYY-MM-DDTHH:MM:SS", "description": "Detalhes" }}
+    
+    2. LER AGENDA:
+    {{ "intent": "consultar_agenda", "time_min": "YYYY-MM-DDTHH:MM:SS", "time_max": "YYYY-MM-DDTHH:MM:SS" }}
+    
+    3. ADICIONAR TAREFA (Coisas rápidas: "comprar pão", "pagar conta"):
+    {{ "intent": "add_task", "item": "Descrição da tarefa" }}
+    
+    4. LISTAR TAREFAS ("o que tenho pendente?", "minha lista"):
+    {{ "intent": "list_tasks" }}
+    
+    5. CONCLUIR TAREFA ("já comprei o pão", "marque pagar conta como feito"):
+    {{ "intent": "complete_task", "item": "trecho do nome da tarefa" }}
+    
+    6. CONVERSA GERAL:
+    {{ "intent": "conversa", "response": "Sua resposta" }}
     """
 
 def ask_gemini(text_input, chat_id, is_audio=False):
     if not GEMINI_KEY: return None
-    
-    # 1. Busca memória
     history = get_chat_history(chat_id)
-    
-    # 2. Monta o prompt com memória
     system_instruction = get_system_prompt()
-    full_prompt = f"{system_instruction}\n\nHISTÓRICO RECENTE:\n{history}\n\nUSUÁRIO ATUAL:\n{text_input}"
+    full_prompt = f"{system_instruction}\n\nHISTÓRICO:\n{history}\n\nUSUÁRIO:\n{text_input}"
     
     model = genai.GenerativeModel("gemini-2.0-flash")
-    
     try:
-        # Se for áudio, precisamos mandar o arquivo + prompt de texto
         content = [text_input, full_prompt] if is_audio else full_prompt
-        
         response = model.generate_content(content, generation_config={"response_mime_type": "application/json"})
         result = json.loads(response.text)
         
-        # Salva o que o usuário disse
-        user_msg = "[Audio Enviado]" if is_audio else text_input
+        user_msg = "[Audio]" if is_audio else text_input
         save_chat_message(chat_id, "user", str(user_msg))
-        
-        # Salva o que a IA respondeu (se for conversa simples)
-        if result.get("intent") == "conversa":
-            save_chat_message(chat_id, "model", result["response"])
-        elif result.get("intent") == "agendar":
-            save_chat_message(chat_id, "model", f"Agendei: {result.get('title')}")
-            
         return result
     except Exception as e:
         print(f"❌ Erro IA: {e}")
         return None
 
-# --- CALENDAR & TOOLS ---
+# --- FERRAMENTAS ---
 def download_telegram_voice(file_id):
     r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}")
     file_path = r.json().get("result", {}).get("file_path")
     if not file_path: return None
-    
     file_content = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}").content
     local_path = "/tmp/voice.ogg"
     with open(local_path, "wb") as f: f.write(file_content)
@@ -163,7 +178,7 @@ class CalendarService:
             if not tmin.endswith("Z"): tmin += "-03:00"
             if not tmax.endswith("Z"): tmax += "-03:00"
             events = service.events().list(calendarId=self.calendar_id, timeMin=tmin, timeMax=tmax, singleEvents=True, orderBy='startTime').execute().get('items', [])
-            if not events: return "📅 Nada agendado."
+            if not events: return "📅 Nada na agenda."
             msg = "📅 **Agenda:**\n"
             for e in events:
                 start = e['start'].get('dateTime', e['start'].get('date'))
@@ -177,43 +192,57 @@ class CalendarService:
 async def telegram_webhook(request: Request):
     try: data = await request.json()
     except: return "error"
-    
     if "message" not in data: return "ok"
+    
     msg = data["message"]
     chat_id = msg["chat"]["id"]
-    
     ai_resp = None
     
-    # 1. Processa Entrada
+    # 1. ENTRADA
     if "text" in msg:
-        print(f"📩 Texto: {msg['text']}")
         ai_resp = ask_gemini(msg['text'], chat_id, is_audio=False)
     elif "voice" in msg:
-        print("🎙️ Voz recebida")
         path = download_telegram_voice(msg["voice"]["file_id"])
         if path:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "🎧 Ouvindo..."})
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "🎧 Processando..."})
             myfile = genai.upload_file(path, mime_type="audio/ogg")
             ai_resp = ask_gemini(myfile, chat_id, is_audio=True)
 
-    # 2. Executa Ação
+    # 2. AÇÃO
     if ai_resp:
         intent = ai_resp.get("intent")
         cal = CalendarService()
-        
+        tasks = TaskService(chat_id) # Instancia o gerenciador de tarefas
+        response_text = ""
+
         if intent == "conversa":
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": ai_resp["response"]})
+            response_text = ai_resp["response"]
             
         elif intent == "agendar":
-            if cal.execute("create", ai_resp):
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": f"✅ Agendado: {ai_resp['title']}"})
-            else:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "❌ Falha ao agendar."})
+            if cal.execute("create", ai_resp): response_text = f"✅ Agendado: {ai_resp['title']}"
+            else: response_text = "❌ Falha ao agendar."
                 
-        elif intent == "consultar":
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "🔍 Consultando..."})
-            resp = cal.execute("list", ai_resp)
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": resp})
-            save_chat_message(chat_id, "model", resp) # Salva o que a IA leu da agenda
+        elif intent == "consultar_agenda":
+            response_text = cal.execute("list", ai_resp)
+        
+        # --- NOVAS LÓGICAS DE TAREFA ---
+        elif intent == "add_task":
+            if tasks.add_task(ai_resp["item"]):
+                response_text = f"📝 Tarefa anotada: {ai_resp['item']}"
+            else: response_text = "❌ Erro ao salvar tarefa."
+            
+        elif intent == "list_tasks":
+            response_text = tasks.list_tasks()
+            
+        elif intent == "complete_task":
+            if tasks.complete_task(ai_resp["item"]):
+                response_text = f"✅ Marquei como feito: {ai_resp['item']}"
+            else: response_text = "🔍 Não achei essa tarefa na lista pendente."
+
+        # Envia resposta e salva no histórico
+        if response_text:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": response_text})
+            if intent != "consultar_agenda" and intent != "list_tasks":
+                save_chat_message(chat_id, "model", response_text)
 
     return {"status": "ok"}
