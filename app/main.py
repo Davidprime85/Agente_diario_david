@@ -3,10 +3,8 @@ import json
 import logging
 import requests
 import io
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, List, Any
-from pathlib import Path
-
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from dotenv import load_dotenv
@@ -26,7 +24,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Jarvis AI Assistant", version="11.0.0 (Ultimate OOP)")
+app = FastAPI(title="Jarvis AI Assistant", version="11.1.0 (Fix ID Type)")
 
 # Variáveis de Ambiente
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -81,39 +79,41 @@ class FirestoreService:
 
     def is_message_processed(self, chat_id: str, message_id: int) -> bool:
         if not self.db: return False
-        doc_ref = self.db.collection('chats').document(chat_id).collection('processed_ids').document(str(message_id))
+        # FIX: Garante que chat_id seja string
+        doc_ref = self.db.collection('chats').document(str(chat_id)).collection('processed_ids').document(str(message_id))
         if doc_ref.get().exists: return True
         doc_ref.set({'timestamp': datetime.now()})
         return False
 
     def save_message(self, chat_id: str, role: str, content: str):
         if not self.db: return
-        self.db.collection('chats').document(chat_id).set({"last_active": datetime.now()}, merge=True)
-        self.db.collection('chats').document(chat_id).collection('mensagens').add({
+        cid = str(chat_id)
+        self.db.collection('chats').document(cid).set({"last_active": datetime.now()}, merge=True)
+        self.db.collection('chats').document(cid).collection('mensagens').add({
             'role': role, 'content': content, 'timestamp': datetime.now()
         })
 
     def get_history(self, chat_id: str, limit: int = 5) -> str:
         if not self.db: return ""
-        docs = self.db.collection('chats').document(chat_id).collection('mensagens').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limit).stream()
+        docs = self.db.collection('chats').document(str(chat_id)).collection('mensagens').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limit).stream()
         return "\n".join(reversed([f"{d.to_dict()['role']}: {d.to_dict()['content']}" for d in docs]))
 
     def reset_history(self, chat_id: str):
         if not self.db: return
-        msgs = self.db.collection('chats').document(chat_id).collection('mensagens').limit(50).stream()
+        msgs = self.db.collection('chats').document(str(chat_id)).collection('mensagens').limit(50).stream()
         for m in msgs: m.reference.delete()
 
     # --- TAREFAS ---
     def add_task(self, chat_id: str, item: str):
-        self.db.collection('chats').document(chat_id).collection('tasks').add({'item': item, 'status': 'pendente', 'created_at': datetime.now()})
+        self.db.collection('chats').document(str(chat_id)).collection('tasks').add({'item': item, 'status': 'pendente', 'created_at': datetime.now()})
     
     def list_tasks(self, chat_id: str) -> str:
-        docs = self.db.collection('chats').document(chat_id).collection('tasks').where(filter=firestore.FieldFilter('status', '==', 'pendente')).stream()
+        docs = self.db.collection('chats').document(str(chat_id)).collection('tasks').where(filter=firestore.FieldFilter('status', '==', 'pendente')).stream()
         tasks = [d.to_dict()['item'] for d in docs]
         return "\n".join([f"• {t}" for t in tasks]) if tasks else "✅ Nenhuma tarefa pendente."
 
     def complete_task(self, chat_id: str, item: str) -> bool:
-        docs = self.db.collection('chats').document(chat_id).collection('tasks').where(filter=firestore.FieldFilter('status', '==', 'pendente')).stream()
+        docs = self.db.collection('chats').document(str(chat_id)).collection('tasks').where(filter=firestore.FieldFilter('status', '==', 'pendente')).stream()
         for d in docs:
             if item.lower() in d.to_dict()['item'].lower():
                 d.reference.update({'status': 'concluido'})
@@ -122,13 +122,13 @@ class FirestoreService:
 
     # --- FINANCEIRO ---
     def add_expense(self, chat_id: str, amount: float, category: str, item: str):
-        self.db.collection('chats').document(chat_id).collection('expenses').add({
+        self.db.collection('chats').document(str(chat_id)).collection('expenses').add({
             'amount': amount, 'category': category, 'item': item, 'timestamp': datetime.now()
         })
 
     def get_report(self, chat_id: str):
         now = datetime.now(); start = datetime(now.year, now.month, 1)
-        docs = self.db.collection('chats').document(chat_id).collection('expenses').where(filter=firestore.FieldFilter('timestamp', '>=', start)).stream()
+        docs = self.db.collection('chats').document(str(chat_id)).collection('expenses').where(filter=firestore.FieldFilter('timestamp', '>=', start)).stream()
         total = 0; txt = ""
         for d in docs:
             data = d.to_dict(); total += data['amount']
@@ -252,81 +252,84 @@ ai = GeminiService()
 tg = TelegramService()
 
 @app.get("/")
-def root(): return {"status": "Jarvis V11 Online 🟢"}
+def root(): return {"status": "Jarvis V11.1 Online 🟢"}
 
 @app.post("/telegram/webhook")
 async def webhook(request: Request):
-    try: data = await request.json()
-    except: return "error"
-    if "message" not in data: return "ok"
-    
-    msg = data["message"]
-    chat_id = msg["chat"]["id"]
-    msg_id = msg["message_id"]
-    text = msg.get("text", "")
+    try:
+        data = await request.json()
+        if "message" not in data: return "ok"
+        
+        msg = data["message"]
+        chat_id = str(msg["chat"]["id"]) # CORREÇÃO CRÍTICA: Garante que é String
+        msg_id = msg["message_id"]
+        text = msg.get("text", "")
 
-    # 1. RESET
-    if text == "/reset":
-        db.reset_history(chat_id)
-        tg.send(chat_id, "🧠 Memória limpa!")
-        return {"status": "reset"}
+        # 1. RESET
+        if text == "/reset":
+            db.reset_history(chat_id)
+            tg.send(chat_id, "🧠 Memória limpa!")
+            return {"status": "reset"}
 
-    # 2. ANTI-LOOP
-    if db.is_message_processed(chat_id, msg_id): return {"status": "ignored"}
+        # 2. ANTI-LOOP
+        if db.is_message_processed(chat_id, msg_id): return {"status": "ignored"}
 
-    # 3. PROCESSAMENTO
-    ai_resp = None
-    if "text" in msg:
-        db.save_message(chat_id, "user", text)
-        hist = db.get_history(chat_id)
-        ai_resp = ai.chat(text, hist)
-    elif "voice" in msg:
-        db.save_message(chat_id, "user", "[Audio]")
-        path = tg.download_voice(msg["voice"]["file_id"])
-        if path:
-            tg.send(chat_id, "🎧 Ouvindo...")
-            myfile = genai.upload_file(path, mime_type="audio/ogg")
+        # 3. PROCESSAMENTO
+        ai_resp = None
+        if "text" in msg:
+            db.save_message(chat_id, "user", text)
             hist = db.get_history(chat_id)
-            ai_resp = ai.chat(myfile, hist, is_audio=True)
+            ai_resp = ai.chat(text, hist)
+        elif "voice" in msg:
+            db.save_message(chat_id, "user", "[Audio]")
+            path = tg.download_voice(msg["voice"]["file_id"])
+            if path:
+                tg.send(chat_id, "🎧 Ouvindo...")
+                myfile = genai.upload_file(path, mime_type="audio/ogg")
+                hist = db.get_history(chat_id)
+                ai_resp = ai.chat(myfile, hist, is_audio=True)
 
-    # 4. AÇÃO
-    if ai_resp:
-        intent = ai_resp.get("intent")
-        resp = ""
-        
-        if intent == "chat": resp = ai_resp.get("response", "")
-        elif intent == "agenda_create": resp = "✅ Agendado." if cal.execute("create", ai_resp) else "❌ Erro."
-        elif intent == "agenda_list": 
-            evs = cal.execute("list", ai_resp)
-            resp = "📅 " + "\n".join([f"{e['start'].get('dateTime')[11:16]} {e['summary']}" for e in evs]) if evs else "📅 Agenda vazia."
-        elif intent == "task_add": db.add_task(chat_id, ai_resp["item"]); resp = f"📝 Add: {ai_resp['item']}"
-        elif intent == "task_list": resp = db.list_tasks(chat_id)
-        elif intent == "task_complete": resp = "✅ Feito." if db.complete_task(chat_id, ai_resp["item"]) else "🔍 Não achei."
-        
-        elif intent == "expense_add":
-            # Correção de vírgula para ponto
-            try:
-                val = float(str(ai_resp["amount"]).replace(',', '.'))
-                db.add_expense(chat_id, val, ai_resp["category"], ai_resp["item"])
-                resp = f"💸 Gasto: R$ {val:.2f}".replace('.', ',')
-            except: resp = "❌ Valor inválido."
+        # 4. AÇÃO
+        if ai_resp:
+            intent = ai_resp.get("intent")
+            resp = ""
             
-        elif intent == "expense_report": resp = db.get_report(chat_id)
-        
-        elif intent == "drive_read":
-            tg.send(chat_id, f"📂 Lendo: {ai_resp['folder_name']}...")
-            files = drv.list_files(ai_resp['folder_name'])
-            if not files: resp = "Pasta vazia."
-            else:
-                # Lê conteúdo do primeiro arquivo
-                content = drv.read_content(files[0]['id'], files[0]['mimeType'])
-                resp = ai.model.generate_content(f"Analise: {content}").text
+            if intent == "chat": resp = ai_resp.get("response", "")
+            elif intent == "agenda_create": resp = "✅ Agendado." if cal.execute("create", ai_resp) else "❌ Erro."
+            elif intent == "agenda_list": 
+                evs = cal.execute("list", ai_resp)
+                resp = "📅 " + "\n".join([f"{e['start'].get('dateTime')[11:16]} {e['summary']}" for e in evs]) if evs else "📅 Agenda vazia."
+            elif intent == "task_add": db.add_task(chat_id, ai_resp["item"]); resp = f"📝 Add: {ai_resp['item']}"
+            elif intent == "task_list": resp = db.list_tasks(chat_id)
+            elif intent == "task_complete": resp = "✅ Feito." if db.complete_task(chat_id, ai_resp["item"]) else "🔍 Não achei."
+            
+            elif intent == "expense_add":
+                # Correção de vírgula para ponto
+                try:
+                    val = float(str(ai_resp["amount"]).replace(',', '.'))
+                    db.add_expense(chat_id, val, ai_resp["category"], ai_resp["item"])
+                    resp = f"💸 Gasto: R$ {val:.2f}".replace('.', ',')
+                except: resp = "❌ Valor inválido."
+                
+            elif intent == "expense_report": resp = db.get_report(chat_id)
+            
+            elif intent == "drive_read":
+                tg.send(chat_id, f"📂 Lendo: {ai_resp['folder_name']}...")
+                files = drv.list_files(ai_resp['folder_name'])
+                if not files: resp = "Pasta vazia."
+                else:
+                    # Lê conteúdo do primeiro arquivo
+                    content = drv.read_content(files[0]['id'], files[0]['mimeType'])
+                    resp = ai.model.generate_content(f"Analise: {content}").text
 
-        if resp:
-            tg.send(chat_id, resp)
-            if intent == "chat": db.save_message(chat_id, "model", resp)
+            if resp:
+                tg.send(chat_id, resp)
+                if intent == "chat": db.save_message(chat_id, "model", resp)
 
-    return {"status": "ok"}
+        return {"status": "ok"}
+    except Exception as e:
+        print(f"ERRO CRÍTICO NO WEBHOOK: {e}")
+        return {"status": "error"}
 
 @app.get("/cron/bom-dia")
 def cron():
@@ -359,7 +362,6 @@ def dashboard():
     
     for doc in all_docs:
         cid = doc.id
-        rep = db.get_report(cid) # Reaproveita lógica do relatório
         # Extrai linhas para tabela (simplificado)
         now = datetime.now(); start = datetime(now.year, now.month, 1)
         exps = db.db.collection('chats').document(cid).collection('expenses').where(filter=firestore.FieldFilter("timestamp", ">=", start)).stream()
