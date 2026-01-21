@@ -1,4 +1,10 @@
 {
+  "crons": [
+    {
+      "path": "/cron/bom-dia",
+      "schedule": "0 11 * * *"
+    }
+  ],
   "builds": [
     {
       "src": "app/main.py",
