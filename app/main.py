@@ -1,236 +1,826 @@
+"""
+Jarvis - Chatbot Pessoal Inteligente
+FastAPI + Gemini 2.0 Flash + Google Services + Telegram
+Versão: Production-Ready para Vercel Serverless
+"""
+
 import os
 import json
-import requests
-import io
-from datetime import datetime
-from typing import Optional, List
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-from google.cloud import firestore
-import google.generativeai as genai
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List
+from pathlib import Path
+import re
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse
 from dotenv import load_dotenv
 
-# --- CONFIGURAÇÕES ---
+# Google Services
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from google.cloud import firestore
+import google.generativeai as genai
+
+# Telegram
+import httpx
+
+# ============================================================================
+# CONFIGURAÇÃO INICIAL
+# ============================================================================
+
 load_dotenv()
-app = FastAPI(title="Jarvis Full System", version="10.1.0 (Fix Moeda)")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID")
+app = FastAPI(title="Jarvis AI Assistant")
 
-# --- SERVIÇO BASE ---
+# Variáveis de Ambiente
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS")
+
+# ============================================================================
+# CLASSE BASE: AUTENTICAÇÃO GOOGLE (Service Account)
+# ============================================================================
+
 class GoogleServiceBase:
-    def __init__(self):
-        self.creds = None
-        scopes = ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/drive.readonly', 'https://www.googleapis.com/auth/datastore']
-        env = os.environ.get("FIREBASE_CREDENTIALS")
-        if env: self.creds = service_account.Credentials.from_service_account_info(json.loads(env), scopes=scopes)
-        elif os.path.exists("firebase-key.json"): self.creds = service_account.Credentials.from_service_account_file("firebase-key.json", scopes=scopes)
-    def get_firestore_client(self): return firestore.Client(credentials=self.creds) if self.creds else None
+    """Gerencia autenticação unificada para todos os serviços Google"""
 
-# --- HELPERS ---
-def format_currency(value): return f"{value:.2f}".replace('.', ',')
-def get_month_name(m): return {1:'Janeiro',2:'Fevereiro',3:'Março',4:'Abril',5:'Maio',6:'Junho',7:'Julho',8:'Agosto',9:'Setembro',10:'Outubro',11:'Novembro',12:'Dezembro'}.get(m,'Mês')
+    SCOPES = [
+        'https://www.googleapis.com/auth/calendar',
+        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/datastore'
+    ]
 
-def send_telegram(chat_id, text):
-    if TELEGRAM_TOKEN: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": text})
+    _credentials = None
+    _firestore_client = None
 
-def download_telegram_voice(file_id):
-    r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={file_id}")
-    path = r.json().get("result", {}).get("file_path")
-    if not path: return None
-    data = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{path}").content
-    with open("/tmp/voice.ogg", "wb") as f: f.write(data)
-    return "/tmp/voice.ogg"
+    @classmethod
+    def get_credentials(cls):
+        """Retorna credenciais da Service Account (local ou env)"""
+        if cls._credentials:
+            return cls._credentials
 
-# --- MEMÓRIA & PROTEÇÃO ---
-def check_is_processed(chat_id, msg_id):
-    base = GoogleServiceBase(); db = base.get_firestore_client()
-    if not db: return False
-    ref = db.collection('chats').document(str(chat_id)).collection('processed_ids').document(str(msg_id))
-    if ref.get().exists: return True
-    ref.set({"ts": datetime.now()}); return False
-
-def reset_memory(chat_id):
-    base = GoogleServiceBase(); db = base.get_firestore_client()
-    if not db: return
-    msgs = db.collection('chats').document(str(chat_id)).collection('mensagens').limit(50).stream()
-    for m in msgs: m.reference.delete()
-
-def save_chat_message(chat_id, role, content):
-    base = GoogleServiceBase(); db = base.get_firestore_client()
-    if db:
-        db.collection('chats').document(str(chat_id)).set({"last_active": datetime.now()}, merge=True)
-        db.collection('chats').document(str(chat_id)).collection('mensagens').add({"role": role, "content": content, "timestamp": datetime.now()})
-
-def get_chat_history(chat_id, limit=5):
-    base = GoogleServiceBase(); db = base.get_firestore_client()
-    if not db: return ""
-    docs = db.collection('chats').document(str(chat_id)).collection('mensagens').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limit).stream()
-    return "\n".join(reversed([f"{d.to_dict()['role']}: {d.to_dict()['content']}" for d in docs]))
-
-# --- SERVIÇOS ---
-class CalendarService(GoogleServiceBase):
-    def __init__(self): super().__init__(); self.calendar_id = CALENDAR_ID
-    def execute(self, action, data):
-        if not self.creds: return None
-        svc = build('calendar', 'v3', credentials=self.creds)
-        if action == "create":
-            svc.events().insert(calendarId=self.calendar_id, body={'summary': data['title'], 'description': data.get('description', ''), 'start': {'dateTime': data['start_iso']}, 'end': {'dateTime': data['end_iso']}}).execute(); return True
-        elif action == "list":
-            tmin, tmax = data['time_min'], data['time_max']
-            if not tmin.endswith("Z"): tmin += "-03:00"
-            if not tmax.endswith("Z"): tmax += "-03:00"
-            return svc.events().list(calendarId=self.calendar_id, timeMin=tmin, timeMax=tmax, singleEvents=True, orderBy='startTime').execute().get('items', [])
-
-class DriveService(GoogleServiceBase):
-    def list_files_in_folder(self, folder_name):
-        if not self.creds: return []
-        svc = build('drive', 'v3', credentials=self.creds)
-        res = svc.files().list(q=f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false", fields="files(id)").execute()
-        if not res.get('files'): return None
-        fid = res.get('files')[0]['id']
-        return svc.files().list(q=f"'{fid}' in parents", fields="files(id, name, mimeType)").execute().get('files', [])
-    def read_file_content(self, file_id, mime_type):
         try:
-            svc = build('drive', 'v3', credentials=self.creds)
-            req = svc.files().export_media(fileId=file_id, mimeType='text/plain') if "google" in mime_type else svc.files().get_media(fileId=file_id)
-            fh = io.BytesIO(); dl = MediaIoBaseDownload(fh, req); done = False
-            while not done: _, done = dl.next_chunk()
-            return fh.getvalue().decode('utf-8', errors='ignore')[:3000]
-        except Exception as e: return f"[Erro: {str(e)}]"
+            # Tenta carregar de variável de ambiente primeiro
+            if FIREBASE_CREDENTIALS:
+                creds_dict = json.loads(FIREBASE_CREDENTIALS)
+                cls._credentials = service_account.Credentials.from_service_account_info(
+                    creds_dict, scopes=cls.SCOPES
+                )
+                logger.info("✅ Credenciais carregadas via FIREBASE_CREDENTIALS")
+            else:
+                # Fallback para arquivo local
+                key_path = Path("firebase-key.json")
+                if not key_path.exists():
+                    raise FileNotFoundError("firebase-key.json não encontrado")
 
-class TaskService(GoogleServiceBase):
-    def __init__(self, chat_id): super().__init__(); self.db = self.get_firestore_client(); self.chat_id = str(chat_id)
-    def add_task(self, item): self.db.collection('chats').document(self.chat_id).collection('tasks').add({"item": item, "status": "pendente"}); return True
-    def list_tasks_formatted(self):
-        docs = self.db.collection('chats').document(self.chat_id).collection('tasks').where(filter=firestore.FieldFilter("status", "==", "pendente")).stream()
-        ls = [d.to_dict()['item'] for d in docs]; return "📝 **Pendências:**\n" + "\n".join([f"• {t}" for t in ls]) if ls else "✅ Nada pendente."
-    def complete_task(self, item):
-        docs = self.db.collection('chats').document(self.chat_id).collection('tasks').where(filter=firestore.FieldFilter("status", "==", "pendente")).stream()
-        for d in docs:
-            if item.lower() in d.to_dict()['item'].lower(): d.reference.update({"status": "concluido"}); return True
-        return False
+                cls._credentials = service_account.Credentials.from_service_account_file(
+                    str(key_path), scopes=cls.SCOPES
+                )
+                logger.info("✅ Credenciais carregadas via firebase-key.json")
 
-class FinanceService(GoogleServiceBase):
-    def __init__(self, chat_id): super().__init__(); self.db = self.get_firestore_client(); self.chat_id = str(chat_id)
-    def add_expense(self, amount, category, item):
-        if not self.db: return False
-        self.db.collection('chats').document(self.chat_id).collection('expenses').add({"amount": float(amount), "category": category, "item": item, "timestamp": datetime.now()}); return True
-    def get_monthly_report(self):
-        now = datetime.now(); start = datetime(now.year, now.month, 1)
-        docs = self.db.collection('chats').document(self.chat_id).collection('expenses').where(filter=firestore.FieldFilter("timestamp", ">=", start)).stream()
-        tot = 0; txt = ""
-        for d in docs: dt = d.to_dict(); tot += dt['amount']; txt += f"• R$ {format_currency(dt['amount'])} ({dt.get('category')}) - {dt.get('item')}\n"
-        return f"📊 **Gastos de {get_month_name(now.month)}:**\n\n{txt}\n💰 **TOTAL: R$ {format_currency(tot)}**" if txt else "💸 Sem gastos."
+            return cls._credentials
 
-# --- AI ---
-if GEMINI_KEY: genai.configure(api_key=GEMINI_KEY)
+        except Exception as e:
+            logger.error(f"❌ Erro ao carregar credenciais: {e}")
+            raise
 
-def analyze_project_folder(folder):
-    drv = DriveService(); files = drv.list_files_in_folder(folder)
-    if not files: return "📂 Pasta vazia ou não achada."
-    txt = ""
-    for f in files[:1]: txt += f"\nFILE {f['name']}: {drv.read_file_content(f['id'], f['mimeType'])}"
-    return genai.GenerativeModel("gemini-2.0-flash").generate_content(f"Analise: {txt}").text
+    @classmethod
+    def get_firestore(cls):
+        """Retorna cliente Firestore singleton"""
+        if cls._firestore_client:
+            return cls._firestore_client
 
-def ask_gemini(text, chat_id, is_audio=False):
-    hist = get_chat_history(chat_id); now = datetime.now()
-    user_p = "[Audio Enviado]" if is_audio else text
-    sys = f"""SYSTEM: Jarvis. Data: {now.strftime('%d/%m %H:%M')}.
-    1. NÃO REPITA o usuário.
-    2. JSON Intents: agendar, consultar_agenda, add_task, list_tasks, complete_task, add_expense, finance_report, analyze_project, conversa.
-    HISTÓRICO: {hist}
-    USUÁRIO: "{user_p}"
-    """
-    try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        content = [text, sys] if is_audio else sys
-        res = json.loads(model.generate_content(content, generation_config={"response_mime_type": "application/json"}).text)
-        if res.get("intent") == "conversa":
-            if res.get("response", "").strip().lower() == text.strip().lower(): res["response"] = "Entendi. Como ajudo?"
-        return res
-    except: return {"intent": "conversa", "response": "Erro interno."}
+        creds = cls.get_credentials()
+        cls._firestore_client = firestore.Client(credentials=creds)
+        return cls._firestore_client
 
-def generate_morning_message(ev, tk): return genai.GenerativeModel("gemini-2.0-flash").generate_content(f"Bom dia. Agenda: {ev}. Tasks: {tk}").text
 
-# --- ROTAS ---
+# ============================================================================
+# SERVIÇO: FIRESTORE (Banco de Dados)
+# ============================================================================
+
+class FirestoreService:
+    """Gerencia todas as operações no Firestore"""
+
+    def __init__(self):
+        self.db = GoogleServiceBase.get_firestore()
+
+    def is_message_processed(self, chat_id: str, message_id: int) -> bool:
+        """VACINA ANTI-LOOP: Verifica se mensagem já foi processada"""
+        doc_ref = self.db.collection('chats').document(chat_id).collection('processed_ids').document(str(message_id))
+        return doc_ref.get().exists
+
+    def mark_message_processed(self, chat_id: str, message_id: int):
+        """Marca mensagem como processada"""
+        doc_ref = self.db.collection('chats').document(chat_id).collection('processed_ids').document(str(message_id))
+        doc_ref.set({'timestamp': firestore.SERVER_TIMESTAMP})
+
+    def save_message(self, chat_id: str, role: str, content: str):
+        """Salva mensagem no histórico"""
+        self.db.collection('chats').document(chat_id).collection('mensagens').add({
+            'role': role,
+            'content': content,
+            'timestamp': firestore.SERVER_TIMESTAMP
+        })
+
+    def get_history(self, chat_id: str, limit: int = 20) -> List[Dict]:
+        """Recupera histórico de mensagens"""
+        messages = self.db.collection('chats').document(chat_id).collection('mensagens')\
+            .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+            .limit(limit)\
+            .stream()
+
+        history = []
+        for msg in messages:
+            data = msg.to_dict()
+            history.append({'role': data['role'], 'parts': [data['content']]})
+
+        return list(reversed(history))
+
+    def reset_history(self, chat_id: str):
+        """Apaga últimas 50 mensagens (comando /reset)"""
+        messages = self.db.collection('chats').document(chat_id).collection('mensagens')\
+            .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+            .limit(50)\
+            .stream()
+
+        batch = self.db.batch()
+        count = 0
+        for msg in messages:
+            batch.delete(msg.reference)
+            count += 1
+
+        batch.commit()
+        logger.info(f"🗑️ Reset: {count} mensagens apagadas para chat {chat_id}")
+
+    def add_task(self, chat_id: str, task: str):
+        """Adiciona tarefa"""
+        self.db.collection('chats').document(chat_id).collection('tasks').add({
+            'task': task,
+            'completed': False,
+            'created_at': firestore.SERVER_TIMESTAMP
+        })
+
+    def get_tasks(self, chat_id: str) -> List[Dict]:
+        """Lista tarefas pendentes"""
+        tasks = self.db.collection('chats').document(chat_id).collection('tasks')\
+            .where('completed', '==', False)\
+            .order_by('created_at')\
+            .stream()
+
+        return [{'id': t.id, **t.to_dict()} for t in tasks]
+
+    def complete_task(self, chat_id: str, task_id: str):
+        """Marca tarefa como concluída"""
+        self.db.collection('chats').document(chat_id).collection('tasks').document(task_id).update({
+            'completed': True,
+            'completed_at': firestore.SERVER_TIMESTAMP
+        })
+
+    def add_expense(self, chat_id: str, amount: float, category: str, item: str):
+        """Adiciona gasto (com correção de moeda)"""
+        self.db.collection('chats').document(chat_id).collection('expenses').add({
+            'amount': amount,
+            'category': category,
+            'item': item,
+            'date': firestore.SERVER_TIMESTAMP
+        })
+
+    def get_monthly_expenses(self, chat_id: str) -> Dict:
+        """Relatório financeiro do mês atual"""
+        now = datetime.now()
+        start_of_month = datetime(now.year, now.month, 1)
+
+        expenses = self.db.collection('chats').document(chat_id).collection('expenses')\
+            .where('date', '>=', start_of_month)\
+            .stream()
+
+        total = 0.0
+        by_category = {}
+
+        for exp in expenses:
+            data = exp.to_dict()
+            amount = data.get('amount', 0)
+            category = data.get('category', 'Outros')
+
+            total += amount
+            by_category[category] = by_category.get(category, 0) + amount
+
+        return {'total': total, 'by_category': by_category}
+
+    def get_all_users(self) -> List[str]:
+        """Retorna lista de todos os chat_ids (para cron)"""
+        chats = self.db.collection('chats').stream()
+        return [chat.id for chat in chats]
+
+
+# ============================================================================
+# SERVIÇO: GOOGLE CALENDAR
+# ============================================================================
+
+class CalendarService:
+    """Gerencia operações no Google Calendar"""
+
+    def __init__(self):
+        creds = GoogleServiceBase.get_credentials()
+        self.service = build('calendar', 'v3', credentials=creds)
+        self.calendar_id = GOOGLE_CALENDAR_ID
+
+    def list_events(self, days_ahead: int = 7) -> List[Dict]:
+        """Lista eventos dos próximos N dias"""
+        try:
+            now = datetime.utcnow().isoformat() + 'Z'
+            end = (datetime.utcnow() + timedelta(days=days_ahead)).isoformat() + 'Z'
+
+            events_result = self.service.events().list(
+                calendarId=self.calendar_id,
+                timeMin=now,
+                timeMax=end,
+                maxResults=10,
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+
+            events = events_result.get('items', [])
+
+            formatted = []
+            for event in events:
+                start = event['start'].get('dateTime', event['start'].get('date'))
+                formatted.append({
+                    'summary': event.get('summary', 'Sem título'),
+                    'start': start
+                })
+
+            return formatted
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao listar eventos: {e}")
+            return []
+
+    def create_event(self, summary: str, start_time: str, duration_hours: int = 1) -> bool:
+        """Cria evento no calendário"""
+        try:
+            start_dt = datetime.fromisoformat(start_time)
+            end_dt = start_dt + timedelta(hours=duration_hours)
+
+            event = {
+                'summary': summary,
+                'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'America/Sao_Paulo'},
+                'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'America/Sao_Paulo'}
+            }
+
+            self.service.events().insert(calendarId=self.calendar_id, body=event).execute()
+            logger.info(f"✅ Evento criado: {summary}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao criar evento: {e}")
+            return False
+
+
+# ============================================================================
+# SERVIÇO: GOOGLE DRIVE
+# ============================================================================
+
+class DriveService:
+    """Gerencia leitura de arquivos no Google Drive"""
+
+    def __init__(self):
+        creds = GoogleServiceBase.get_credentials()
+        self.service = build('drive', 'v3', credentials=creds)
+
+    def find_folder(self, folder_name: str) -> Optional[str]:
+        """Encontra ID da pasta pelo nome"""
+        try:
+            results = self.service.files().list(
+                q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'",
+                fields="files(id, name)"
+            ).execute()
+
+            items = results.get('files', [])
+            return items[0]['id'] if items else None
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao buscar pasta: {e}")
+            return None
+
+    def list_files(self, folder_id: str) -> List[Dict]:
+        """Lista arquivos de uma pasta"""
+        try:
+            results = self.service.files().list(
+                q=f"'{folder_id}' in parents",
+                fields="files(id, name, mimeType)",
+                pageSize=10
+            ).execute()
+
+            return results.get('files', [])
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao listar arquivos: {e}")
+            return []
+
+    def read_file_content(self, file_id: str, max_chars: int = 3000) -> str:
+        """Lê conteúdo de arquivo (limitado para evitar timeout)"""
+        try:
+            request = self.service.files().get_media(fileId=file_id)
+            content = request.execute()
+
+            text = content.decode('utf-8', errors='ignore')
+            return text[:max_chars]
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao ler arquivo: {e}")
+            return ""
+
+
+# ============================================================================
+# SERVIÇO: GEMINI (Cérebro da IA)
+# ============================================================================
+
+class GeminiService:
+    """Gerencia interações com o Gemini 2.0 Flash"""
+
+    SYSTEM_PROMPT = """Você é Jarvis, um assistente pessoal inteligente.
+
+REGRAS CRÍTICAS:
+1. NUNCA repita o texto do usuário de volta.
+2. SEMPRE retorne JSON estruturado com "intent" e "data".
+3. Seja direto e objetivo.
+
+INTENTS DISPONÍVEIS:
+- "agenda_list": Listar eventos
+- "agenda_create": Criar evento (data ISO, summary)
+- "task_add": Adicionar tarefa
+- "task_list": Listar tarefas
+- "task_complete": Concluir tarefa (task_id)
+- "expense_add": Adicionar gasto (amount, category, item)
+- "expense_report": Relatório mensal
+- "drive_list": Listar arquivos (folder_name)
+- "drive_read": Ler arquivo (folder_name)
+- "chat": Conversa casual
+
+FORMATO DE RESPOSTA:
+{
+  "intent": "nome_da_intent",
+  "data": {...},
+  "message": "Resposta amigável para o usuário"
+}
+
+Exemplo:
+Usuário: "Adiciona reunião amanhã às 14h"
+Você: {"intent": "agenda_create", "data": {"summary": "Reunião", "start_time": "2026-01-22T14:00:00"}, "message": "Reunião agendada para amanhã às 14h!"}
+"""
+
+    def __init__(self):
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel('gemini-2.0-flash-exp')
+
+    def chat(self, user_message: str, history: List[Dict]) -> str:
+        """Envia mensagem para o Gemini com histórico"""
+        try:
+            # Adiciona system prompt no início do histórico
+            full_history = [{'role': 'user', 'parts': [self.SYSTEM_PROMPT]}] + history
+
+            chat = self.model.start_chat(history=full_history)
+            response = chat.send_message(user_message)
+
+            # TRAVA DE SEGURANÇA: Anti-Papagaio
+            if response.text.strip() == user_message.strip():
+                logger.warning("⚠️ IA tentou repetir mensagem do usuário. Forçando resposta padrão.")
+                return json.dumps({
+                    "intent": "chat",
+                    "message": "Entendi, como posso ajudar?"
+                })
+
+            return response.text
+
+        except Exception as e:
+            logger.error(f"❌ Erro no Gemini: {e}")
+            return json.dumps({"intent": "error", "message": "Desculpe, tive um problema técnico."})
+
+    def transcribe_audio(self, audio_bytes: bytes) -> str:
+        """Transcreve áudio usando Gemini (multimodal)"""
+        try:
+            # Upload do arquivo de áudio
+            audio_file = genai.upload_file(audio_bytes, mime_type="audio/ogg")
+
+            response = self.model.generate_content([
+                "Transcreva este áudio em português:",
+                audio_file
+            ])
+
+            return response.text
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao transcrever áudio: {e}")
+            return ""
+
+    def analyze_document(self, content: str, question: str) -> str:
+        """Analisa documento e responde pergunta"""
+        try:
+            prompt = f"""Analise o seguinte documento e responda a pergunta:
+
+DOCUMENTO:
+{content}
+
+PERGUNTA: {question}
+
+Seja conciso e objetivo."""
+
+            response = self.model.generate_content(prompt)
+            return response.text
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao analisar documento: {e}")
+            return "Não consegui analisar o documento."
+
+
+# ============================================================================
+# SERVIÇO: TELEGRAM
+# ============================================================================
+
+class TelegramService:
+    """Gerencia envio de mensagens via Telegram"""
+
+    def __init__(self):
+        self.token = TELEGRAM_TOKEN
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
+
+    async def send_message(self, chat_id: str, text: str):
+        """Envia mensagem de texto"""
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{self.base_url}/sendMessage",
+                    json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+                )
+        except Exception as e:
+            logger.error(f"❌ Erro ao enviar mensagem: {e}")
+
+    async def download_file(self, file_id: str) -> bytes:
+        """Baixa arquivo do Telegram"""
+        try:
+            async with httpx.AsyncClient() as client:
+                # Obter file_path
+                file_info = await client.get(f"{self.base_url}/getFile?file_id={file_id}")
+                file_path = file_info.json()['result']['file_path']
+
+                # Baixar arquivo
+                file_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+                response = await client.get(file_url)
+                return response.content
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao baixar arquivo: {e}")
+            return b""
+
+
+# ============================================================================
+# ORQUESTRADOR PRINCIPAL
+# ============================================================================
+
+class JarvisOrchestrator:
+    """Orquestra todas as funcionalidades do Jarvis"""
+
+    def __init__(self):
+        self.db = FirestoreService()
+        self.calendar = CalendarService()
+        self.drive = DriveService()
+        self.gemini = GeminiService()
+        self.telegram = TelegramService()
+
+    def parse_amount(self, amount_str: str) -> float:
+        """Converte string com vírgula para float (ex: '45,50' -> 45.50)"""
+        try:
+            # Remove espaços e substitui vírgula por ponto
+            cleaned = amount_str.strip().replace(',', '.')
+            return float(cleaned)
+        except:
+            return 0.0
+
+    async def process_message(self, chat_id: str, message_id: int, user_text: str, voice_file_id: Optional[str] = None):
+        """Processa mensagem do usuário (texto ou voz)"""
+
+        # VACINA ANTI-LOOP: Verifica se já processou esta mensagem
+        if self.db.is_message_processed(chat_id, message_id):
+            logger.info(f"⏭️ Mensagem {message_id} já processada. Ignorando.")
+            return {"status": "ignored"}
+
+        # Marca como processada IMEDIATAMENTE
+        self.db.mark_message_processed(chat_id, message_id)
+
+        # Se for áudio, transcreve primeiro
+        if voice_file_id:
+            audio_bytes = await self.telegram.download_file(voice_file_id)
+            user_text = self.gemini.transcribe_audio(audio_bytes)
+            if not user_text:
+                await self.telegram.send_message(chat_id, "Não consegui entender o áudio.")
+                return {"status": "error"}
+
+        # Comando especial: /reset
+        if user_text.strip().lower() == '/reset':
+            self.db.reset_history(chat_id)
+            await self.telegram.send_message(chat_id, "🔄 Histórico resetado! Vamos começar do zero.")
+            return {"status": "reset"}
+
+        # Salva mensagem do usuário
+        self.db.save_message(chat_id, 'user', user_text)
+
+        # Recupera histórico
+        history = self.db.get_history(chat_id)
+
+        # Envia para o Gemini
+        ai_response = self.gemini.chat(user_text, history)
+
+        # Parse da resposta JSON
+        try:
+            response_data = json.loads(ai_response)
+            intent = response_data.get('intent', 'chat')
+            data = response_data.get('data', {})
+            message = response_data.get('message', 'Entendi!')
+        except:
+            # Se não for JSON válido, trata como conversa casual
+            intent = 'chat'
+            message = ai_response
+            data = {}
+
+        # Executa ação baseada na intent
+        final_message = await self._execute_intent(chat_id, intent, data, message)
+
+        # Salva resposta da IA
+        self.db.save_message(chat_id, 'model', final_message)
+
+        # Envia resposta ao usuário
+        await self.telegram.send_message(chat_id, final_message)
+
+        return {"status": "success", "intent": intent}
+
+    async def _execute_intent(self, chat_id: str, intent: str, data: Dict, base_message: str) -> str:
+        """Executa ação específica baseada na intent"""
+
+        try:
+            if intent == 'agenda_list':
+                events = self.calendar.list_events(days_ahead=data.get('days', 7))
+                if not events:
+                    return "📅 Nenhum evento agendado nos próximos dias."
+
+                event_list = "\n".join([f"• {e['summary']} - {e['start']}" for e in events])
+                return f"📅 *Próximos Eventos:*\n{event_list}"
+
+            elif intent == 'agenda_create':
+                summary = data.get('summary', 'Evento')
+                start_time = data.get('start_time')
+
+                if self.calendar.create_event(summary, start_time):
+                    return f"✅ {base_message}"
+                return "❌ Não consegui criar o evento."
+
+            elif intent == 'task_add':
+                task = data.get('task', '')
+                self.db.add_task(chat_id, task)
+                return f"✅ Tarefa adicionada: *{task}*"
+
+            elif intent == 'task_list':
+                tasks = self.db.get_tasks(chat_id)
+                if not tasks:
+                    return "📝 Nenhuma tarefa pendente!"
+
+                task_list = "\n".join([f"• {t['task']}" for t in tasks])
+                return f"📝 *Tarefas Pendentes:*\n{task_list}"
+
+            elif intent == 'task_complete':
+                task_id = data.get('task_id')
+                self.db.complete_task(chat_id, task_id)
+                return "✅ Tarefa concluída!"
+
+            elif intent == 'expense_add':
+                # CORREÇÃO DE MOEDA
+                amount_str = str(data.get('amount', '0'))
+                amount = self.parse_amount(amount_str)
+                category = data.get('category', 'Outros')
+                item = data.get('item', 'Item')
+
+                self.db.add_expense(chat_id, amount, category, item)
+                return f"💰 Gasto registrado: R$ {amount:.2f} em *{category}* ({item})"
+
+            elif intent == 'expense_report':
+                report = self.db.get_monthly_expenses(chat_id)
+                total = report['total']
+
+                if total == 0:
+                    return "💰 Nenhum gasto registrado este mês."
+
+                category_breakdown = "\n".join([f"• {cat}: R$ {val:.2f}" for cat, val in report['by_category'].items()])
+                return f"💰 *Relatório Mensal:*\n{category_breakdown}\n\n*Total: R$ {total:.2f}*"
+
+            elif intent == 'drive_list':
+                folder_name = data.get('folder_name', '')
+                folder_id = self.drive.find_folder(folder_name)
+
+                if not folder_id:
+                    return f"❌ Pasta '{folder_name}' não encontrada."
+
+                files = self.drive.list_files(folder_id)
+                if not files:
+                    return f"📂 Pasta '{folder_name}' está vazia."
+
+                file_list = "\n".join([f"• {f['name']}" for f in files])
+                return f"📂 *Arquivos em '{folder_name}':*\n{file_list}"
+
+            elif intent == 'drive_read':
+                folder_name = data.get('folder_name', '')
+                folder_id = self.drive.find_folder(folder_name)
+
+                if not folder_id:
+                    return f"❌ Pasta '{folder_name}' não encontrada."
+
+                files = self.drive.list_files(folder_id)
+                if not files:
+                    return f"📂 Nenhum arquivo para analisar."
+
+                # Lê primeiro arquivo (limitado a 3000 chars)
+                first_file = files[0]
+                content = self.drive.read_file_content(first_file['id'])
+
+                # Envia para Gemini analisar
+                analysis = self.gemini.analyze_document(content, data.get('question', 'Resuma este documento'))
+                return f"📄 *Análise de '{first_file['name']}':*\n\n{analysis}"
+
+            else:
+                # Conversa casual
+                return base_message
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao executar intent {intent}: {e}")
+            return f"❌ Erro ao processar: {str(e)}"
+
+
+# ============================================================================
+# ROTAS DA API
+# ============================================================================
+
+orchestrator = JarvisOrchestrator()
+
 @app.get("/")
-def home(): return {"status": "Jarvis V10.1 Online"}
+async def root():
+    """Health check"""
+    return {"status": "online", "service": "Jarvis AI Assistant"}
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    base = GoogleServiceBase(); db = base.get_firestore_client()
-    if not db: return "Erro DB"
-    docs = db.collection('chats').stream()
-    html = "<html><body><h1>Dashboard</h1>"
-    for doc in docs:
-        cid = doc.id; now = datetime.now(); start = datetime(now.year, now.month, 1)
-        exps = db.collection('chats').document(cid).collection('expenses').where(filter=firestore.FieldFilter("timestamp", ">=", start)).stream()
-        tot = 0; rows = ""; has = False
-        for e in exps: d = e.to_dict(); tot += d['amount']; rows += f"<p>{d['timestamp'].strftime('%d/%m')} - {d['item']}: R$ {format_currency(d['amount'])}</p>"; has = True
-        if has: html += f"<h3>User: {cid}</h3>{rows}<p><b>Total: R$ {format_currency(tot)}</b></p><hr>"
-    return html + "</body></html>"
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """Recebe mensagens do Telegram via Webhook"""
+    try:
+        data = await request.json()
+
+        # Extrai informações da mensagem
+        message = data.get('message', {})
+        chat_id = str(message.get('chat', {}).get('id', ''))
+        message_id = message.get('message_id', 0)
+
+        # Texto ou voz
+        user_text = message.get('text', '')
+        voice = message.get('voice')
+        voice_file_id = voice.get('file_id') if voice else None
+
+        if not chat_id:
+            return JSONResponse({"status": "ignored"})
+
+        # Processa mensagem
+        result = await orchestrator.process_message(chat_id, message_id, user_text, voice_file_id)
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        logger.error(f"❌ Erro no webhook: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
 
 @app.get("/cron/bom-dia")
-def cron():
-    base = GoogleServiceBase(); db = base.get_firestore_client()
-    if not db: return {"err": "db"}
-    docs = db.collection('chats').stream(); count = 0
-    now = datetime.now(); tmin = now.strftime("%Y-%m-%dT00:00:00"); tmax = now.strftime("%Y-%m-%dT23:59:59")
-    for d in docs:
-        cid = d.id; cal = CalendarService(); tsk = TaskService(cid)
-        ev = cal.execute("list", {"time_min": tmin, "time_max": tmax}); ev_txt = ", ".join([e['summary'] for e in ev]) if ev else "Nada"
-        tk_txt = tsk.list_tasks_formatted()
-        send_telegram(cid, generate_morning_message(ev_txt, tk_txt)); count += 1
-    return {"sent": count}
+async def cron_bom_dia():
+    """Rotina matinal: Envia resumo do dia para todos os usuários"""
+    try:
+        users = orchestrator.db.get_all_users()
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
-    try: data = await request.json()
-    except: return "error"
-    if "message" not in data: return "ok"
-    
-    msg = data["message"]; chat_id = msg["chat"]["id"]; msg_id = msg["message_id"]; text = msg.get("text", "")
+        for chat_id in users:
+            # Busca eventos do dia
+            events = orchestrator.calendar.list_events(days_ahead=1)
+            event_text = "\n".join([f"• {e['summary']}" for e in events]) if events else "Nenhum evento agendado."
 
-    if text == "/reset": reset_memory(chat_id); send_telegram(chat_id, "🧠 Memória Resetada!"); return {"status": "reset"}
-    if check_is_processed(chat_id, msg_id): return {"status": "ignored"}
+            # Busca tarefas pendentes
+            tasks = orchestrator.db.get_tasks(chat_id)
+            task_text = "\n".join([f"• {t['task']}" for t in tasks[:5]]) if tasks else "Nenhuma tarefa pendente."
 
-    ai_resp = None
-    if "text" in msg: save_chat_message(chat_id, "user", text); ai_resp = ask_gemini(text, chat_id)
-    elif "voice" in msg:
-        save_chat_message(chat_id, "user", "[Audio]"); path = download_telegram_voice(msg["voice"]["file_id"])
-        if path: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "🎧..."}); myfile = genai.upload_file(path, mime_type="audio/ogg"); ai_resp = ask_gemini(myfile, chat_id, is_audio=True)
+            # Gera mensagem motivacional com Gemini
+            prompt = f"""Gere uma mensagem de bom dia motivacional (máximo 3 linhas) incluindo:
 
-    if ai_resp:
-        intent = ai_resp.get("intent")
-        cal = CalendarService(); tsk = TaskService(chat_id); fin = FinanceService(chat_id); resp = ""
-        
-        if intent == "conversa": resp = ai_resp["response"]
-        elif intent == "agendar": resp = f"✅ Agendado: {ai_resp['title']}" if cal.execute("create", ai_resp) else "❌ Erro."
-        elif intent == "consultar_agenda": ev = cal.execute("list", ai_resp); resp = "📅 " + "\n".join([f"{e['start'].get('dateTime')[11:16]} {e['summary']}" for e in ev]) if ev else "📅 Vazia."
-        elif intent == "add_task": tsk.add_task(ai_resp["item"]); resp = f"📝 Add: {ai_resp['item']}"
-        elif intent == "list_tasks": resp = tsk.list_tasks_formatted()
-        elif intent == "complete_task": resp = "✅ Feito." if tsk.complete_task(ai_resp["item"]) else "🔍 Nao achei."
-        
-        elif intent == "add_expense":
-            # --- CORREÇÃO DE VÍRGULA/FLOAT ---
-            try:
-                # Troca vírgula por ponto antes de converter
-                raw_val = str(ai_resp["amount"]).replace(',', '.')
-                val = float(raw_val)
-                fin.add_expense(val, ai_resp["category"], ai_resp["item"])
-                resp = f"💸 Gasto: R$ {format_currency(val)}"
-            except Exception as e:
-                resp = f"❌ Erro de valor. Tente dizer '45 reais' sem centavos. (Erro: {str(e)})"
-            # ---------------------------------
+Eventos de hoje:
+{event_text}
 
-        elif intent == "finance_report": resp = fin.get_monthly_report()
-        elif intent == "analyze_project": send_telegram(chat_id, f"📂 Lendo: {ai_resp['folder']}..."); resp = analyze_project_folder(ai_resp["folder"])
+Tarefas pendentes:
+{task_text}
 
-        if resp: send_telegram(chat_id, resp); save_chat_message(chat_id, "model", resp) if "consultar" not in intent else None
+Seja positivo e energizante!"""
 
-    return {"status": "ok"}
+            morning_message = orchestrator.gemini.model.generate_content(prompt).text
+
+            # Envia mensagem
+            await orchestrator.telegram.send_message(chat_id, f"☀️ *Bom dia!*\n\n{morning_message}")
+
+        return {"status": "success", "users_notified": len(users)}
+
+    except Exception as e:
+        logger.error(f"❌ Erro no cron bom-dia: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """Dashboard web com histórico financeiro"""
+    try:
+        users = orchestrator.db.get_all_users()
+
+        html_rows = ""
+        for chat_id in users:
+            report = orchestrator.db.get_monthly_expenses(chat_id)
+            total = report['total']
+
+            categories = ", ".join([f"{cat}: R$ {val:.2f}" for cat, val in report['by_category'].items()])
+
+            html_rows += f"""
+            <tr>
+                <td>{chat_id}</td>
+                <td>R$ {total:.2f}</td>
+                <td>{categories or 'Nenhum gasto'}</td>
+            </tr>
+            """
+
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Jarvis Dashboard</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    margin: 40px;
+                    background: #f5f5f5;
+                }}
+                h1 {{
+                    color: #333;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    background: white;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                }}
+                th, td {{
+                    padding: 12px;
+                    text-align: left;
+                    border-bottom: 1px solid #ddd;
+                }}
+                th {{
+                    background: #4CAF50;
+                    color: white;
+                }}
+                tr:hover {{
+                    background: #f1f1f1;
+                }}
+            </style>
+        </head>
+        <body>
+            <h1>💰 Jarvis - Dashboard Financeiro</h1>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Usuário (Chat ID)</th>
+                        <th>Total Mensal</th>
+                        <th>Categorias</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {html_rows}
+                </tbody>
+            </table>
+        </body>
+        </html>
+        """
+
+        return HTMLResponse(content=html)
+
+    except Exception as e:
+        logger.error(f"❌ Erro no dashboard: {e}")
+        return HTMLResponse(content=f"<h1>Erro: {str(e)}</h1>", status_code=500)
+
+
+# ============================================================================
+# INICIALIZAÇÃO (Para Vercel)
+# ============================================================================
+
+# Vercel espera uma variável chamada "app" ou "handler"
+handler = app
