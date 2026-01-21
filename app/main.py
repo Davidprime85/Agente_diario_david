@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 # --- CONFIGURAÇÕES ---
 load_dotenv()
-app = FastAPI(title="Agente Jarvis", version="2.0.0 (Tasks)")
+app = FastAPI(title="Agente Jarvis", version="3.0.0 (Finance)")
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -47,7 +47,7 @@ def save_chat_message(chat_id, role, content):
             "role": role, "content": content, "timestamp": datetime.now()
         })
 
-# --- GERENCIAMENTO DE TAREFAS (NOVO) ---
+# --- SERVIÇO DE TAREFAS ---
 class TaskService:
     def __init__(self, chat_id):
         self.db = get_firestore_client()
@@ -55,11 +55,8 @@ class TaskService:
 
     def add_task(self, item):
         if not self.db: return False
-        # Salva na coleção 'tasks' dentro do documento do usuário
         self.db.collection('chats').document(self.chat_id).collection('tasks').add({
-            "item": item,
-            "status": "pendente",
-            "created_at": datetime.now()
+            "item": item, "status": "pendente", "created_at": datetime.now()
         })
         return True
 
@@ -67,20 +64,16 @@ class TaskService:
         if not self.db: return "Erro no banco."
         docs = self.db.collection('chats').document(self.chat_id).collection('tasks')\
                  .where(filter=firestore.FieldFilter("status", "==", "pendente")).stream()
-        
         tasks = [doc.to_dict()['item'] for doc in docs]
         if not tasks: return "✅ Nenhuma tarefa pendente!"
-        
         msg = "📝 **Suas Pendências:**\n"
         for t in tasks: msg += f"• {t}\n"
         return msg
 
     def complete_task(self, item_name):
         if not self.db: return False
-        # Busca tarefa pelo nome (aproximado) para marcar como feita
         docs = self.db.collection('chats').document(self.chat_id).collection('tasks')\
                  .where(filter=firestore.FieldFilter("status", "==", "pendente")).stream()
-        
         found = False
         for doc in docs:
             data = doc.to_dict()
@@ -88,6 +81,44 @@ class TaskService:
                 doc.reference.update({"status": "concluido"})
                 found = True
         return found
+
+# --- SERVIÇO FINANCEIRO (NOVO) ---
+class FinanceService:
+    def __init__(self, chat_id):
+        self.db = get_firestore_client()
+        self.chat_id = str(chat_id)
+
+    def add_expense(self, amount, category, item):
+        if not self.db: return False
+        self.db.collection('chats').document(self.chat_id).collection('expenses').add({
+            "amount": float(amount),
+            "category": category,
+            "item": item,
+            "timestamp": datetime.now()
+        })
+        return True
+
+    def get_monthly_report(self):
+        if not self.db: return "Erro no banco."
+        
+        # Filtra do dia 1 do mês atual até agora
+        now = datetime.now()
+        start_date = datetime(now.year, now.month, 1)
+        
+        docs = self.db.collection('chats').document(self.chat_id).collection('expenses')\
+                 .where(filter=firestore.FieldFilter("timestamp", ">=", start_date)).stream()
+        
+        total = 0.0
+        details = ""
+        for doc in docs:
+            data = doc.to_dict()
+            val = data.get('amount', 0)
+            total += val
+            details += f"• R$ {val:.2f} ({data.get('category')}) - {data.get('item')}\n"
+            
+        if total == 0: return "💸 Nenhum gasto registrado neste mês."
+        
+        return f"📊 **Gastos de {now.strftime('%B')}:**\n\n{details}\n💰 **TOTAL: R$ {total:.2f}**"
 
 # --- GEMINI CÉREBRO ---
 if GEMINI_KEY: genai.configure(api_key=GEMINI_KEY)
@@ -97,28 +128,24 @@ def get_system_prompt():
     dias = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
     dia_semana = dias[now.weekday()]
     return f"""
-    SYSTEM: Você é o Jarvis, um assistente pessoal eficiente.
+    SYSTEM: Você é o Jarvis, assistente pessoal.
     Data: {now.strftime('%Y-%m-%d %H:%M')} ({dia_semana}).
     
-    INTENÇÕES POSSÍVEIS (Retorne APENAS JSON):
+    INTENÇÕES (Retorne APENAS JSON):
     
-    1. AGENDAR (Google Calendar):
-    {{ "intent": "agendar", "title": "Titulo", "start_iso": "YYYY-MM-DDTHH:MM:SS", "end_iso": "YYYY-MM-DDTHH:MM:SS", "description": "Detalhes" }}
+    1. AGENDAR: {{ "intent": "agendar", "title": "Titulo", "start_iso": "...", "end_iso": "...", "description": "..." }}
+    2. CONSULTAR AGENDA: {{ "intent": "consultar_agenda", "time_min": "...", "time_max": "..." }}
+    3. ADD TAREFA: {{ "intent": "add_task", "item": "..." }}
+    4. LISTAR TAREFAS: {{ "intent": "list_tasks" }}
+    5. CONCLUIR TAREFA: {{ "intent": "complete_task", "item": "..." }}
     
-    2. LER AGENDA:
-    {{ "intent": "consultar_agenda", "time_min": "YYYY-MM-DDTHH:MM:SS", "time_max": "YYYY-MM-DDTHH:MM:SS" }}
+    6. ADD GASTO (Ex: "gastei 50 no uber", "comprei almoço por 30 reais"):
+    {{ "intent": "add_expense", "amount": 50.00, "category": "Categoria (Transporte, Alimentação, Lazer, Contas)", "item": "Descrição curta" }}
     
-    3. ADICIONAR TAREFA (Coisas rápidas: "comprar pão", "pagar conta"):
-    {{ "intent": "add_task", "item": "Descrição da tarefa" }}
+    7. RELATORIO FINANCEIRO (Ex: "quanto gastei esse mês?", "resumo financeiro"):
+    {{ "intent": "finance_report" }}
     
-    4. LISTAR TAREFAS ("o que tenho pendente?", "minha lista"):
-    {{ "intent": "list_tasks" }}
-    
-    5. CONCLUIR TAREFA ("já comprei o pão", "marque pagar conta como feito"):
-    {{ "intent": "complete_task", "item": "trecho do nome da tarefa" }}
-    
-    6. CONVERSA GERAL:
-    {{ "intent": "conversa", "response": "Sua resposta" }}
+    8. CONVERSA: {{ "intent": "conversa", "response": "..." }}
     """
 
 def ask_gemini(text_input, chat_id, is_audio=False):
@@ -131,11 +158,7 @@ def ask_gemini(text_input, chat_id, is_audio=False):
     try:
         content = [text_input, full_prompt] if is_audio else full_prompt
         response = model.generate_content(content, generation_config={"response_mime_type": "application/json"})
-        result = json.loads(response.text)
-        
-        user_msg = "[Audio]" if is_audio else text_input
-        save_chat_message(chat_id, "user", str(user_msg))
-        return result
+        return json.loads(response.text)
     except Exception as e:
         print(f"❌ Erro IA: {e}")
         return None
@@ -163,16 +186,10 @@ class CalendarService:
     def execute(self, action, data):
         if not self.creds: return "Erro de credenciais"
         service = build('calendar', 'v3', credentials=self.creds)
-        
         if action == "create":
-            body = {
-                'summary': data['title'], 'description': data.get('description', ''),
-                'start': {'dateTime': data['start_iso'], 'timeZone': 'America/Sao_Paulo'},
-                'end': {'dateTime': data['end_iso'], 'timeZone': 'America/Sao_Paulo'}
-            }
+            body = {'summary': data['title'], 'description': data.get('description', ''), 'start': {'dateTime': data['start_iso']}, 'end': {'dateTime': data['end_iso']}}
             service.events().insert(calendarId=self.calendar_id, body=body).execute()
             return True
-            
         elif action == "list":
             tmin, tmax = data['time_min'], data['time_max']
             if not tmin.endswith("Z"): tmin += "-03:00"
@@ -198,21 +215,24 @@ async def telegram_webhook(request: Request):
     chat_id = msg["chat"]["id"]
     ai_resp = None
     
-    # 1. ENTRADA
+    # ENTRADA
     if "text" in msg:
         ai_resp = ask_gemini(msg['text'], chat_id, is_audio=False)
+        save_chat_message(chat_id, "user", msg['text']) # Salva input texto
     elif "voice" in msg:
         path = download_telegram_voice(msg["voice"]["file_id"])
         if path:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "🎧 Processando..."})
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": "🎧 Ouvindo..."})
             myfile = genai.upload_file(path, mime_type="audio/ogg")
             ai_resp = ask_gemini(myfile, chat_id, is_audio=True)
+            save_chat_message(chat_id, "user", "[Audio Enviado]")
 
-    # 2. AÇÃO
+    # AÇÃO
     if ai_resp:
         intent = ai_resp.get("intent")
         cal = CalendarService()
-        tasks = TaskService(chat_id) # Instancia o gerenciador de tarefas
+        tasks = TaskService(chat_id)
+        finance = FinanceService(chat_id) # Instancia o financeiro
         response_text = ""
 
         if intent == "conversa":
@@ -225,24 +245,29 @@ async def telegram_webhook(request: Request):
         elif intent == "consultar_agenda":
             response_text = cal.execute("list", ai_resp)
         
-        # --- NOVAS LÓGICAS DE TAREFA ---
         elif intent == "add_task":
-            if tasks.add_task(ai_resp["item"]):
-                response_text = f"📝 Tarefa anotada: {ai_resp['item']}"
-            else: response_text = "❌ Erro ao salvar tarefa."
+            if tasks.add_task(ai_resp["item"]): response_text = f"📝 Tarefa anotada: {ai_resp['item']}"
             
         elif intent == "list_tasks":
             response_text = tasks.list_tasks()
             
         elif intent == "complete_task":
-            if tasks.complete_task(ai_resp["item"]):
-                response_text = f"✅ Marquei como feito: {ai_resp['item']}"
-            else: response_text = "🔍 Não achei essa tarefa na lista pendente."
+            if tasks.complete_task(ai_resp["item"]): response_text = f"✅ Feito: {ai_resp['item']}"
+            else: response_text = "🔍 Tarefa não encontrada."
 
-        # Envia resposta e salva no histórico
+        # --- NOVAS AÇÕES FINANCEIRAS ---
+        elif intent == "add_expense":
+            if finance.add_expense(ai_resp["amount"], ai_resp["category"], ai_resp["item"]):
+                response_text = f"💸 Gasto anotado: R$ {ai_resp['amount']} ({ai_resp['item']})"
+            else: response_text = "❌ Erro ao salvar gasto."
+            
+        elif intent == "finance_report":
+            response_text = finance.get_monthly_report()
+
+        # Resposta Final
         if response_text:
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": response_text})
-            if intent != "consultar_agenda" and intent != "list_tasks":
+            if "consultar" not in intent and "list" not in intent and "report" not in intent:
                 save_chat_message(chat_id, "model", response_text)
 
     return {"status": "ok"}
