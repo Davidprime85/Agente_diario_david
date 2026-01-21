@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 # --- CONFIGURAÇÕES ---
 load_dotenv()
-app = FastAPI(title="Agente Jarvis", version="4.0.0 (Cron+FinanceBR)")
+app = FastAPI(title="Agente Jarvis", version="4.1.0 (CronFix)")
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -33,7 +33,6 @@ def get_firestore_client():
 
 # --- AUXILIARES ---
 def format_currency(value):
-    """Transforma 10.5 em 10,50"""
     return f"{value:.2f}".replace('.', ',')
 
 def get_month_name(month_int):
@@ -50,6 +49,8 @@ class FinanceService:
     def __init__(self, chat_id):
         self.db = get_firestore_client()
         self.chat_id = str(chat_id)
+        # Garante registro do usuário
+        if self.db: self.db.collection('chats').document(self.chat_id).set({"last_active": datetime.now()}, merge=True)
 
     def add_expense(self, amount, category, item):
         if not self.db: return False
@@ -72,12 +73,10 @@ class FinanceService:
             data = doc.to_dict()
             val = data.get('amount', 0)
             total += val
-            # Correção BR: Vírgula
             details += f"• R$ {format_currency(val)} ({data.get('category')}) - {data.get('item')}\n"
             
         if total == 0: return "💸 Nenhum gasto registrado neste mês."
         
-        # Correção BR: Nome do Mês
         nome_mes = get_month_name(now.month)
         return f"📊 **Gastos de {nome_mes}:**\n\n{details}\n💰 **TOTAL: R$ {format_currency(total)}**"
 
@@ -85,6 +84,8 @@ class TaskService:
     def __init__(self, chat_id):
         self.db = get_firestore_client()
         self.chat_id = str(chat_id)
+        # Garante registro do usuário
+        if self.db: self.db.collection('chats').document(self.chat_id).set({"last_active": datetime.now()}, merge=True)
         
     def add_task(self, item):
         if not self.db: return False
@@ -94,7 +95,6 @@ class TaskService:
         return True
 
     def list_tasks_raw(self):
-        """Retorna lista pura para uso interno"""
         if not self.db: return []
         docs = self.db.collection('chats').document(self.chat_id).collection('tasks')\
                  .where(filter=firestore.FieldFilter("status", "==", "pendente")).stream()
@@ -140,10 +140,10 @@ class CalendarService:
             if not tmin.endswith("Z"): tmin += "-03:00"
             if not tmax.endswith("Z"): tmax += "-03:00"
             events = service.events().list(calendarId=self.calendar_id, timeMin=tmin, timeMax=tmax, singleEvents=True, orderBy='startTime').execute().get('items', [])
-            return events # Retorna objeto puro para formatar depois
+            return events
         return None
 
-# --- MEMÓRIA ---
+# --- MEMÓRIA (CORRIGIDA) ---
 def get_chat_history(chat_id, limit=5):
     db = get_firestore_client()
     if not db: return ""
@@ -155,7 +155,12 @@ def get_chat_history(chat_id, limit=5):
 def save_chat_message(chat_id, role, content):
     db = get_firestore_client()
     if db:
-        db.collection('chats').document(str(chat_id)).collection('mensagens').add({
+        # CORREÇÃO: Cria o documento "pai" para o Cron conseguir listar
+        user_ref = db.collection('chats').document(str(chat_id))
+        user_ref.set({"last_active": datetime.now()}, merge=True)
+        
+        # Salva a mensagem
+        user_ref.collection('mensagens').add({
             "role": role, "content": content, "timestamp": datetime.now()
         })
 
@@ -163,7 +168,6 @@ def save_chat_message(chat_id, role, content):
 if GEMINI_KEY: genai.configure(api_key=GEMINI_KEY)
 
 def ask_gemini(text_input, chat_id, is_audio=False):
-    # Prompt padrão de conversa
     history = get_chat_history(chat_id)
     now = datetime.now()
     dias = ['Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado', 'Domingo']
@@ -191,9 +195,8 @@ def ask_gemini(text_input, chat_id, is_audio=False):
     except: return None
 
 def generate_morning_message(events, tasks):
-    # Prompt Específico para o Bom Dia
     prompt = f"""
-    Crie um texto de "Bom dia" curto, motivacional e útil para o David.
+    Crie um texto de "Bom dia" curto, motivacional e útil.
     
     Agenda de Hoje:
     {events}
@@ -212,18 +215,15 @@ def generate_morning_message(events, tasks):
 # --- ROTAS & CRON ---
 @app.get("/cron/bom-dia")
 def cron_bom_dia():
-    """Rota que o Vercel chama todo dia"""
     print("☀️ Iniciando Rotina de Bom Dia...")
     db = get_firestore_client()
     if not db: return {"status": "error", "msg": "Sem banco"}
     
-    # 1. Pega todos os chats que conversaram com o bot
-    # (Itera sobre a coleção 'chats' para achar o ID do David)
+    # Agora isso vai funcionar porque criamos o documento pai
     docs = db.collection('chats').stream()
     
     cal = CalendarService()
     now = datetime.now()
-    # Agenda de hoje (00:00 até 23:59)
     time_min = now.strftime("%Y-%m-%dT00:00:00")
     time_max = now.strftime("%Y-%m-%dT23:59:59")
     cal_data = {"time_min": time_min, "time_max": time_max}
@@ -232,13 +232,10 @@ def cron_bom_dia():
     for doc in docs:
         chat_id = doc.id
         
-        # 2. Busca dados do usuário
         tasks_service = TaskService(chat_id)
-        
         events_list = cal.execute("list", cal_data)
         tasks_list = tasks_service.list_tasks_raw()
         
-        # Formata para a IA ler
         events_txt = "Nada na agenda."
         if isinstance(events_list, list) and events_list:
             events_txt = "\n".join([f"- {e['summary']} às {e['start'].get('dateTime')[11:16]}" for e in events_list])
@@ -247,7 +244,6 @@ def cron_bom_dia():
         if tasks_list:
             tasks_txt = "\n".join([f"- {t}" for t in tasks_list])
             
-        # 3. Gera texto e envia
         msg_final = generate_morning_message(events_txt, tasks_txt)
         send_telegram(chat_id, msg_final)
         count += 1
@@ -264,7 +260,6 @@ async def telegram_webhook(request: Request):
     chat_id = msg["chat"]["id"]
     ai_resp = None
     
-    # DOWNLOAD VOICE helper
     def get_voice(fid):
         r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={fid}")
         path = r.json().get("result", {}).get("file_path")
@@ -303,7 +298,6 @@ async def telegram_webhook(request: Request):
         elif intent == "complete_task":
             if tasks.complete_task(ai_resp["item"]): resp = f"✅ Feito: {ai_resp['item']}"
         
-        # --- FINANCEIRO CORRIGIDO ---
         elif intent == "add_expense":
             val = float(ai_resp["amount"])
             if fin.add_expense(val, ai_resp["category"], ai_resp["item"]):
