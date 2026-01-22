@@ -239,17 +239,26 @@ async def webhook(request: Request):
                 response_text = "✅ Feito." if result["status"] == "completed" else "🔍 Não achei."
             
             elif intent == "add_expense":
+                # Extrai valor da resposta da IA ou tenta extrair do texto original
+                amount_raw = ai_response.get("amount", "")
+                if not amount_raw or amount_raw == "0" or amount_raw == 0:
+                    # Tenta extrair do texto original do usuário
+                    import re
+                    amount_match = re.search(r'(\d+[.,]\d+|\d+)', text)
+                    if amount_match:
+                        amount_raw = amount_match.group(1)
+                
                 result = add_expense_uc.execute(
                     chat_id=chat_id,
-                    amount_str=str(ai_response.get("amount", "0")),
+                    amount_str=str(amount_raw) if amount_raw else "0",
                     category=ai_response.get("category", "outros"),
                     item=ai_response.get("item", "")
                 )
                 if result["status"] == "created":
                     from app.core.utils import format_currency_br
-                    response_text = f"💸 Gasto: R$ {format_currency_br(result['amount'])}"
+                    response_text = f"💸 Gasto: R$ {format_currency_br(result['amount'])} - {result.get('item', '')}"
                 else:
-                    response_text = "❌ Erro valor."
+                    response_text = f"❌ Erro valor: {result.get('message', 'Valor inválido')}"
             
             elif intent == "finance_report":
                 result = monthly_report_uc.execute(chat_id)

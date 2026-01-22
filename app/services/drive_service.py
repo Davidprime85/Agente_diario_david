@@ -23,12 +23,32 @@ class DriveService:
         """
         REGRA 5: Busca pasta com case-insensitive contains.
         Usa 'contains' na query do Drive API.
+        IMPORTANTE: A pasta precisa estar compartilhada com a service account.
         """
         if not self.service:
+            logger.error("Drive service não disponível - verifique credenciais")
             return None
         
         try:
-            query = (
+            # Busca exata primeiro
+            query_exact = (
+                f"mimeType='application/vnd.google-apps.folder' "
+                f"and name='{name_query}' "
+                f"and trashed=false"
+            )
+            
+            result = (
+                self.service.files()
+                .list(q=query_exact, fields="files(id, name)")
+                .execute()
+            )
+            
+            folders = result.get('files', [])
+            if folders:
+                return folders[0]
+            
+            # Se não encontrou exato, busca com contains (case-insensitive)
+            query_contains = (
                 f"mimeType='application/vnd.google-apps.folder' "
                 f"and name contains '{name_query}' "
                 f"and trashed=false"
@@ -36,14 +56,19 @@ class DriveService:
             
             result = (
                 self.service.files()
-                .list(q=query, fields="files(id, name)")
+                .list(q=query_contains, fields="files(id, name)")
                 .execute()
             )
             
             folders = result.get('files', [])
-            return folders[0] if folders else None
+            if folders:
+                logger.info(f"Encontrada pasta: {folders[0]['name']} (busca por contains)")
+                return folders[0]
+            
+            logger.warning(f"Nenhuma pasta encontrada com nome contendo '{name_query}'")
+            return None
         except Exception as e:
-            logger.error(f"Erro ao buscar pasta: {e}")
+            logger.error(f"Erro ao buscar pasta: {e}", exc_info=True)
             return None
     
     def list_files_in_folder(self, folder_id: str) -> List[Dict]:

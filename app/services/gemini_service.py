@@ -38,6 +38,10 @@ class GeminiService:
    - agendar, consultar_agenda, add_task, list_tasks, complete_task, add_expense, finance_report
    - analyze_project (Use isso se o usuario pedir para ler/resumir arquivos de uma pasta JÁ listada ou nova)
    - conversa
+3. IMPORTANTE para add_expense:
+   - Se o usuário digitar "50,00" ou "50.00", extraia EXATAMENTE como está (com vírgula ou ponto)
+   - O campo "amount" deve conter o valor EXATO digitado pelo usuário (ex: "50,00" ou "50.00")
+   - NÃO converta para número, mantenha como string com vírgula ou ponto
 HISTÓRICO: {history_str}
 USUÁRIO: "{user_prompt}"
 """
