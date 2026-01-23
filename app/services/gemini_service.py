@@ -2,6 +2,7 @@
 Google Gemini AI Service
 """
 import json
+import re
 import logging
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -53,20 +54,28 @@ USUÁRIO: "{user_prompt}"
                 generation_config={"response_mime_type": "application/json"}
             )
             
-            data = json.loads(response.text)
+            raw = (response.text or "").strip()
+            # Tenta extrair JSON se vier em markdown (```json ... ```)
+            if raw.startswith("```"):
+                raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                raw = re.sub(r'\s*```$', '', raw)
+            
+            data = json.loads(raw)
             
             # REGRA 4: Anti-Papagaio
             if data.get("intent") == "conversa":
                 ai_response = data.get("response", "").strip().lower()
-                user_text_lower = text.strip().lower()
-                
+                user_text_lower = (text or "").strip().lower()
                 if ai_response == user_text_lower or not ai_response:
                     data["response"] = "Entendi. Como posso ajudar?"
             
             return data
+        except json.JSONDecodeError as e:
+            logger.error(f"IA retornou JSON inválido: {e}. Raw: {raw[:500] if raw else 'vazio'}")
+            return {"intent": "conversa", "response": "Desculpe, não consegui processar. Tente de novo."}
         except Exception as e:
-            logger.error(f"Erro na IA: {e}")
-            return {"intent": "conversa", "response": "Erro IA."}
+            logger.error(f"Erro na IA: {e}", exc_info=True)
+            return {"intent": "conversa", "response": "Desculpe, tive um problema. Tente em instantes."}
     
     def generate_content(self, prompt: str) -> str:
         """Gera conteúdo a partir de um prompt"""

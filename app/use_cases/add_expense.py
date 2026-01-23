@@ -13,29 +13,24 @@ class AddExpenseUseCase:
     
     def execute(self, chat_id: str, amount_str: str, category: str, item: str) -> dict:
         """
-        Adiciona gasto financeiro
-        
-        Args:
-            amount_str: Valor em formato BR ("50,00") ou EN ("50.00")
-        
-        Returns:
-            dict: {"status": "created" | "error", "amount": float, "message": str}
+        Adiciona gasto financeiro.
+        amount_str pode ser: "50,00", "R$ 50,00" ou até o texto completo "Adicione gasto 50,00 lanche".
+        to_float extrai o valor de qualquer um desses formatos.
         """
-        try:
-            chat_id_str = ensure_string_id(chat_id)
-            # REGRA 2: Conversão de moeda padronizada
-            amount = to_float(amount_str)
-            
-            self.db.add_expense(chat_id_str, amount, category, item)
-            
-            return {
-                "status": "created",
-                "amount": amount,
-                "category": category,
-                "item": item
-            }
-        except ValueError as e:
+        chat_id_str = ensure_string_id(chat_id)
+        amount = to_float(amount_str)
+
+        if amount <= 0:
             return {
                 "status": "error",
-                "message": f"Erro ao converter valor: {str(e)}"
+                "message": "Não consegui identificar o valor. Ex: Adicione gasto 50,00 lanche"
             }
+
+        self.db.add_expense(chat_id_str, amount, category or "outros", item or "gasto")
+
+        return {
+            "status": "created",
+            "amount": amount,
+            "category": category or "outros",
+            "item": item or "gasto"
+        }

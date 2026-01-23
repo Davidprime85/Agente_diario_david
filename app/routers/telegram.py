@@ -8,6 +8,7 @@ import google.generativeai as genai
 
 from app.services.firestore_service import FirestoreService
 from app.services.gemini_service import GeminiService
+from app.services.drive_service import DriveService  # Added import
 # TelegramService não usado diretamente aqui, usando requests diretamente
 from app.use_cases.create_task import CreateTaskUseCase
 from app.use_cases.list_tasks import ListTasksUseCase
@@ -153,6 +154,7 @@ async def webhook(request: Request):
             send_telegram_message(chat_id, resumo)
             return {"status": "resumo"}
         
+        # COMANDO PASTA COM DIAGNÓSTICO
         if text.startswith("/pasta") or text.startswith("/arquivos"):
             parts = text.split(" ", 1)
             if len(parts) < 2:
@@ -160,10 +162,24 @@ async def webhook(request: Request):
                 return {"status": "ask_name"}
             
             folder_query = parts[1]
+            send_telegram_message(chat_id, f"🔍 Procurando pasta '{folder_query}'...")
+            
+            # Executa o Use Case
             result = analyze_file_uc.execute(folder_query)
             
             if result["status"] == "not_found":
-                send_telegram_message(chat_id, result["summary"])
+                # --- DIAGNÓSTICO DE EMAIL ---
+                drive_svc = DriveService()
+                bot_email = drive_svc.get_bot_email()
+                
+                msg_erro = (
+                    f"❌ Não encontrei a pasta '{folder_query}'.\n\n"
+                    f"🕵️ **Diagnóstico:**\n"
+                    f"Estou logado como: `{bot_email}`\n\n"
+                    f"👉 Vá no Google Drive, clique na pasta com botão direito > Compartilhar > E cole esse e-mail como **Editor**."
+                )
+                send_telegram_message(chat_id, msg_erro)
+                
             elif result["status"] == "empty":
                 send_telegram_message(chat_id, result["summary"])
             else:
@@ -203,75 +219,82 @@ async def webhook(request: Request):
         if ai_response:
             intent = ai_response.get("intent")
             response_text = ""
-            
-            if intent == "conversa":
-                response_text = ai_response.get("response", "")
-            
-            elif intent == "agendar":
-                result = create_event_uc.execute(
-                    title=ai_response.get("title", ""),
-                    start_iso=ai_response.get("start_iso", ""),
-                    end_iso=ai_response.get("end_iso", ""),
-                    description=ai_response.get("description", "")
-                )
-                response_text = "✅ Agendado." if result["status"] == "created" else "❌ Erro."
-            
-            elif intent == "consultar_agenda":
-                result = list_events_uc.execute(
-                    time_min=ai_response.get("time_min", ""),
-                    time_max=ai_response.get("time_max", "")
-                )
-                if result["events"]:
-                    event_list = [e.get('summary', 'Sem título') for e in result["events"]]
-                    response_text = "📅 " + "\n".join(event_list)
-                else:
-                    response_text = "📅 Vazia."
-            
-            elif intent == "add_task":
-                result = create_task_uc.execute(chat_id, ai_response.get("item", ""))
-                response_text = f"📝 Add: {result['item']}"
-            
-            elif intent == "list_tasks":
-                response_text = list_tasks_uc.execute(chat_id)
-            
-            elif intent == "complete_task":
-                result = complete_task_uc.execute(chat_id, ai_response.get("item", ""))
-                response_text = "✅ Feito." if result["status"] == "completed" else "🔍 Não achei."
-            
-            elif intent == "add_expense":
-                # Extrai valor da resposta da IA ou tenta extrair do texto original
-                amount_raw = ai_response.get("amount", "")
-                if not amount_raw or amount_raw == "0" or amount_raw == 0:
-                    # Tenta extrair do texto original do usuário
-                    import re
-                    amount_match = re.search(r'(\d+[.,]\d+|\d+)', text)
-                    if amount_match:
-                        amount_raw = amount_match.group(1)
-                
-                result = add_expense_uc.execute(
-                    chat_id=chat_id,
-                    amount_str=str(amount_raw) if amount_raw else "0",
-                    category=ai_response.get("category", "outros"),
-                    item=ai_response.get("item", "")
-                )
-                if result["status"] == "created":
-                    from app.core.utils import format_currency_br
-                    response_text = f"💸 Gasto: R$ {format_currency_br(result['amount'])} - {result.get('item', '')}"
-                else:
-                    response_text = f"❌ Erro valor: {result.get('message', 'Valor inválido')}"
-            
-            elif intent == "finance_report":
-                result = monthly_report_uc.execute(chat_id)
-                response_text = result.get("formatted", "💸 Nada.")
-            
-            elif intent == "analyze_project":
-                folder_name = ai_response.get("folder", "")
-                if folder_name:
-                    send_telegram_message(chat_id, f"📂 Analisando '{folder_name}'...")
-                    result = analyze_file_uc.execute(folder_name)
-                    response_text = result.get("summary", "Erro ao analisar.")
-                else:
-                    response_text = "Qual pasta você quer analisar?"
+
+            # Fallback: IA falhou mas o texto parece add_expense — extrair valor direto do texto
+            _erro_ia = ai_response.get("response") or ""
+            _is_erro = _erro_ia in ("Erro IA.", "Desculpe, não consegui processar. Tente de novo.", "Desculpe, tive um problema. Tente em instantes.")
+            if _is_erro and text:
+                from app.core.utils import to_float
+                import re
+                amt = to_float(text)
+                if amt > 0 and any(w in text.lower() for w in ["gasto", "despesa", "adicionar", "gastei"]):
+                    m = re.search(r'[\d.,]+\s*(.+)', text)
+                    item = (m.group(1).strip() if (m and m.group(1).strip()) else "gasto")
+                    result = add_expense_uc.execute(chat_id, text, "outros", item)
+                    if result["status"] == "created":
+                        from app.core.utils import format_currency_br
+                        response_text = f"💸 Gasto: R$ {format_currency_br(result['amount'])} - {result.get('item', '')}"
+
+            if not response_text:
+                if intent == "conversa":
+                    response_text = ai_response.get("response", "")
+
+                elif intent == "agendar":
+                    result = create_event_uc.execute(
+                        title=ai_response.get("title", ""),
+                        start_iso=ai_response.get("start_iso", ""),
+                        end_iso=ai_response.get("end_iso", ""),
+                        description=ai_response.get("description", "")
+                    )
+                    response_text = "✅ Agendado." if result["status"] == "created" else "❌ Erro."
+
+                elif intent == "consultar_agenda":
+                    result = list_events_uc.execute(
+                        time_min=ai_response.get("time_min", ""),
+                        time_max=ai_response.get("time_max", "")
+                    )
+                    if result["events"]:
+                        event_list = [e.get('summary', 'Sem título') for e in result["events"]]
+                        response_text = "📅 " + "\n".join(event_list)
+                    else:
+                        response_text = "📅 Vazia."
+
+                elif intent == "add_task":
+                    result = create_task_uc.execute(chat_id, ai_response.get("item", ""))
+                    response_text = f"📝 Add: {result['item']}"
+
+                elif intent == "list_tasks":
+                    response_text = list_tasks_uc.execute(chat_id)
+
+                elif intent == "complete_task":
+                    result = complete_task_uc.execute(chat_id, ai_response.get("item", ""))
+                    response_text = "✅ Feito." if result["status"] == "completed" else "🔍 Não achei."
+
+                elif intent == "add_expense":
+                    result = add_expense_uc.execute(
+                        chat_id=chat_id,
+                        amount_str=text,
+                        category=ai_response.get("category", "outros"),
+                        item=ai_response.get("item", "")
+                    )
+                    if result["status"] == "created":
+                        from app.core.utils import format_currency_br
+                        response_text = f"💸 Gasto: R$ {format_currency_br(result['amount'])} - {result.get('item', '')}"
+                    else:
+                        response_text = f"❌ {result.get('message', 'Valor inválido')}"
+
+                elif intent == "finance_report":
+                    result = monthly_report_uc.execute(chat_id)
+                    response_text = result.get("formatted", "💸 Nada.")
+
+                elif intent == "analyze_project":
+                    folder_name = ai_response.get("folder", "")
+                    if folder_name:
+                        send_telegram_message(chat_id, f"📂 Analisando '{folder_name}'...")
+                        result = analyze_file_uc.execute(folder_name)
+                        response_text = result.get("summary", "Erro ao analisar.")
+                    else:
+                        response_text = "Qual pasta você quer analisar?"
             
             # Envia resposta
             if response_text:

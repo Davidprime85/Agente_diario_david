@@ -2,41 +2,44 @@
 Core utilities: currency conversion, ID normalization, etc.
 """
 import re
-from typing import Union
+from typing import Any, Union
 
 
-def to_float(value: Union[str, float, int]) -> float:
+def to_float(value: Any) -> float:
     """
-    Converte string de moeda (BR ou EN) para float.
-    Aceita "50,00", "50.00", " 50 , 20 " ou número direto.
-    
-    Args:
-        value: String ou número a ser convertido
-        
-    Returns:
-        float: Valor convertido
-        
-    Raises:
-        ValueError: Se não conseguir converter
+    Extrai o valor numérico de qualquer texto, ignorando R$, espaços e letras.
+    Exemplos:
+    "R$ 50,00" -> 50.0
+    "50.00" -> 50.0
+    "Adicione gasto 50,00 lanche" -> 50.0
+    "Gastei 50 reais" -> 50.0
     """
-    if isinstance(value, (int, float)):
+    if value is None:
+        return 0.0
+
+    if isinstance(value, (float, int)):
         return float(value)
-    
-    if not isinstance(value, str):
-        raise ValueError(f"Tipo inválido para conversão: {type(value)}")
-    
-    # Remove espaços e caracteres especiais (exceto vírgula e ponto)
-    cleaned = re.sub(r'[^\d,.]', '', value.strip())
-    
-    # Se tem vírgula, assume formato BR (50,00)
-    if ',' in cleaned:
-        # Remove pontos (milhares) e substitui vírgula por ponto
-        cleaned = cleaned.replace('.', '').replace(',', '.')
-    
+
+    text = str(value).strip()
+
+    # REGEX: Busca apenas números, pontos e vírgulas (ignora R$, "Gasto", etc.)
+    match = re.search(r'[\d.,]+', text)
+
+    if not match:
+        return 0.0
+
+    clean_num = match.group(0)
+
+    # Lógica Brasil vs EUA
+    # Se tem vírgula, remove pontos de milhar e troca vírgula por ponto
+    if "," in clean_num:
+        clean_num = clean_num.replace(".", "")  # Tira milhar (1.000,00 -> 1000,00)
+        clean_num = clean_num.replace(",", ".")  # Decimal (1000,00 -> 1000.00)
+
     try:
-        return float(cleaned)
+        return float(clean_num)
     except ValueError:
-        raise ValueError(f"Não foi possível converter '{value}' para número")
+        return 0.0
 
 
 def format_currency_br(value: float) -> str:

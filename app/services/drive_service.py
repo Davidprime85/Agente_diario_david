@@ -16,24 +16,35 @@ class DriveService:
     """Serviço de integração com Google Drive"""
     
     def __init__(self):
-        creds = GoogleAuth.get_credentials()
-        self.service = build('drive', 'v3', credentials=creds) if creds else None
+        self.creds = GoogleAuth.get_credentials()
+        self.service = build('drive', 'v3', credentials=self.creds) if self.creds else None
+        
+        # --- NOVO: Captura o e-mail do robô para diagnóstico ---
+        try:
+            self.email = self.creds.service_account_email
+        except AttributeError:
+            self.email = "Email não identificado (verifique credenciais)"
+            
+    def get_bot_email(self) -> str:
+        """Retorna o e-mail da conta de serviço"""
+        return self.email
     
     def search_folder(self, name_query: str) -> Optional[Dict]:
         """
-        REGRA 5: Busca pasta com case-insensitive contains.
-        Usa 'contains' na query do Drive API.
-        IMPORTANTE: A pasta precisa estar compartilhada com a service account.
+        Busca pasta com case-insensitive contains.
         """
         if not self.service:
             logger.error("Drive service não disponível - verifique credenciais")
             return None
         
+        # Limpa aspas para evitar erro de sintaxe
+        safe_name = name_query.replace("'", "")
+        
         try:
-            # Busca exata primeiro
+            # 1. Busca exata primeiro (mais rápido)
             query_exact = (
                 f"mimeType='application/vnd.google-apps.folder' "
-                f"and name='{name_query}' "
+                f"and name='{safe_name}' "
                 f"and trashed=false"
             )
             
@@ -47,10 +58,10 @@ class DriveService:
             if folders:
                 return folders[0]
             
-            # Se não encontrou exato, busca com contains (case-insensitive)
+            # 2. Se não encontrou exato, busca com contains (case-insensitive)
             query_contains = (
                 f"mimeType='application/vnd.google-apps.folder' "
-                f"and name contains '{name_query}' "
+                f"and name contains '{safe_name}' "
                 f"and trashed=false"
             )
             
@@ -65,7 +76,7 @@ class DriveService:
                 logger.info(f"Encontrada pasta: {folders[0]['name']} (busca por contains)")
                 return folders[0]
             
-            logger.warning(f"Nenhuma pasta encontrada com nome contendo '{name_query}'")
+            logger.warning(f"Nenhuma pasta encontrada com nome contendo '{safe_name}'")
             return None
         except Exception as e:
             logger.error(f"Erro ao buscar pasta: {e}", exc_info=True)
@@ -80,7 +91,7 @@ class DriveService:
             query = f"'{folder_id}' in parents and trashed=false"
             result = (
                 self.service.files()
-                .list(q=query, fields="files(id, name, mimeType)")
+                .list(q=query, fields="files(id, name, mimeType)", pageSize=15)
                 .execute()
             )
             return result.get('files', [])
@@ -88,7 +99,7 @@ class DriveService:
             logger.error(f"Erro ao listar arquivos: {e}")
             return []
     
-    def read_file_content(self, file_id: str, mime_type: str, max_length: int = 3000) -> str:
+    def read_file_content(self, file_id: str, mime_type: str, max_length: int = 4000) -> str:
         """Lê conteúdo de um arquivo (primeiros max_length chars)"""
         if not self.service:
             return ""
@@ -111,4 +122,4 @@ class DriveService:
             return content[:max_length]
         except Exception as e:
             logger.error(f"Erro ao ler arquivo: {e}")
-            return ""
+            return f"[Erro ao ler arquivo: {str(e)}]"
