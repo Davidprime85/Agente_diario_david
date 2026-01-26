@@ -22,19 +22,48 @@ class CalendarService:
     def create_event(self, title: str, start_iso: str, end_iso: str, description: str = "") -> bool:
         """Cria evento no calendário"""
         if not self.service:
+            logger.error("Calendar service não disponível")
+            return False
+        
+        if not self.calendar_id:
+            logger.error("GOOGLE_CALENDAR_ID não configurado")
             return False
         
         try:
+            from datetime import datetime, timedelta
+            
+            # Normaliza formato ISO
+            start_clean = start_iso.replace('Z', '+00:00')
+            if not end_iso:
+                # Se não tem end, adiciona 1 hora
+                try:
+                    dt_start = datetime.fromisoformat(start_clean)
+                    dt_end = dt_start + timedelta(hours=1)
+                    end_iso = dt_end.isoformat()
+                except:
+                    end_iso = start_iso
+            
+            end_clean = end_iso.replace('Z', '+00:00')
+            
+            # Garante timezone se não tiver
+            if '+' not in start_clean and '-' not in start_clean[-6:]:
+                start_clean += '-03:00'
+            if '+' not in end_clean and '-' not in end_clean[-6:]:
+                end_clean += '-03:00'
+            
             body = {
                 'summary': title,
-                'description': description,
-                'start': {'dateTime': start_iso},
-                'end': {'dateTime': end_iso}
+                'description': description or "",
+                'start': {'dateTime': start_clean, 'timeZone': 'America/Sao_Paulo'},
+                'end': {'dateTime': end_clean, 'timeZone': 'America/Sao_Paulo'}
             }
-            self.service.events().insert(calendarId=self.calendar_id, body=body).execute()
+            
+            logger.info(f"Criando evento: {title} em {start_clean}")
+            result = self.service.events().insert(calendarId=self.calendar_id, body=body).execute()
+            logger.info(f"Evento criado com sucesso: {result.get('id')}")
             return True
         except Exception as e:
-            logger.error(f"Erro ao criar evento: {e}")
+            logger.error(f"Erro ao criar evento: {e}", exc_info=True)
             return False
     
     def list_events(self, time_min: str, time_max: str) -> List[Dict]:

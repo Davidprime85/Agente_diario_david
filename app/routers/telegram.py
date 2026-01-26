@@ -2,6 +2,7 @@
 Telegram Router - Webhook endpoint
 """
 import logging
+import re
 import requests
 from fastapi import APIRouter, Request
 import google.generativeai as genai
@@ -372,28 +373,92 @@ async def webhook(request: Request):
                     response_text = ai_response.get("response", "")
 
                 elif intent == "agendar":
-                    title = ai_response.get("title", "")
-                    start_iso = ai_response.get("start_iso", "")
-                    end_iso = ai_response.get("end_iso", "")
-                    description = ai_response.get("description", "")
-                    
-                    if not title or not start_iso:
-                        response_text = "❌ Não consegui entender a data/hora. Ex: 'Lembrar amanhã 8h colocar comida'"
-                    else:
-                        result = create_event_uc.execute(title, start_iso, end_iso, description)
-                        if result["status"] == "created":
-                            # Formata data/hora para mostrar ao usuário
-                            try:
-                                from datetime import datetime
-                                dt = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
-                                hora_formatada = dt.strftime('%d/%m às %H:%M')
-                                response_text = f"✅ Lembrete agendado!\n\n📅 {title}\n🕐 {hora_formatada}"
-                                if description:
-                                    response_text += f"\n📝 {description}"
-                            except:
-                                response_text = f"✅ Lembrete agendado: {title}"
+                    try:
+                        title = ai_response.get("title", "")
+                        start_iso = ai_response.get("start_iso", "")
+                        end_iso = ai_response.get("end_iso", "")
+                        description = ai_response.get("description", "")
+                        
+                        logger.info(f"Tentando agendar: title={title}, start_iso={start_iso}, end_iso={end_iso}")
+                        
+                        # Fallback: se não tem start_iso, tenta extrair do texto original
+                        if not start_iso:
+                            from datetime import datetime, timedelta
+                            
+                            text_lower = text.lower()
+                            now = datetime.now()
+                            
+                            # Extrai hora
+                            hora_match = re.search(r'(\d{1,2})[h:](\d{2})?', text_lower)
+                            hora = None
+                            minuto = 0
+                            
+                            if hora_match:
+                                hora = int(hora_match.group(1))
+                                if hora_match.group(2):
+                                    minuto = int(hora_match.group(2))
+                            
+                            # Determina data
+                            if "amanhã" in text_lower or "amanha" in text_lower:
+                                target_date = now + timedelta(days=1)
+                            elif "hoje" in text_lower:
+                                target_date = now
+                            else:
+                                target_date = now + timedelta(days=1)  # Default: amanhã
+                            
+                            if hora is not None:
+                                start_iso = target_date.replace(hour=hora, minute=minuto, second=0, microsecond=0).isoformat() + "-03:00"
+                                logger.info(f"Data/hora extraída do texto: {start_iso}")
+                        
+                        if not title:
+                            # Tenta extrair título do texto
+                            # Remove palavras de tempo e mantém o resto
+                            title = re.sub(r'\b(lembrar|lembrete|lembre-me|agendar|amanhã|hoje|às|as|h|hora)\b', '', text, flags=re.IGNORECASE).strip()
+                            if not title:
+                                title = "Lembrete"
+                        
+                        if not title:
+                            response_text = "❌ Não consegui entender o que você quer lembrar. Ex: 'Lembrar amanhã 8h colocar comida'"
+                        elif not start_iso:
+                            response_text = "❌ Não consegui entender a data/hora. Ex: 'Lembrar amanhã 8h colocar comida'"
                         else:
-                            response_text = f"❌ Erro ao agendar. Verifique a data/hora informada."
+                            # Se não tem end_iso, cria com 1 hora de duração
+                            if not end_iso:
+                                from datetime import datetime, timedelta
+                                try:
+                                    dt_start = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+                                    dt_end = dt_start + timedelta(hours=1)
+                                    end_iso = dt_end.isoformat()
+                                except:
+                                    # Se não conseguir parsear, adiciona 1 hora como string
+                                    end_iso = start_iso  # Fallback
+                            
+                            result = create_event_uc.execute(title, start_iso, end_iso, description)
+                            
+                            if result["status"] == "created":
+                                # Formata data/hora para mostrar ao usuário
+                                try:
+                                    from datetime import datetime
+                                    # Tenta diferentes formatos de ISO
+                                    start_clean = start_iso.replace('Z', '+00:00')
+                                    if 'T' in start_clean:
+                                        dt = datetime.fromisoformat(start_clean)
+                                    else:
+                                        # Se não tem T, adiciona
+                                        dt = datetime.fromisoformat(start_clean.replace(' ', 'T'))
+                                    hora_formatada = dt.strftime('%d/%m às %H:%M')
+                                    response_text = f"✅ Lembrete agendado!\n\n📅 {title}\n🕐 {hora_formatada}"
+                                    if description:
+                                        response_text += f"\n📝 {description}"
+                                except Exception as e:
+                                    logger.warning(f"Erro ao formatar data: {e}, usando formato simples")
+                                    response_text = f"✅ Lembrete agendado: {title}"
+                            else:
+                                logger.error(f"Erro ao criar evento: {result}")
+                                response_text = f"❌ Erro ao agendar. Verifique se a data/hora está correta. Tente: 'Lembrar amanhã 8h colocar comida'"
+                    except Exception as e:
+                        logger.error(f"Erro ao processar agendamento: {e}", exc_info=True)
+                        response_text = f"❌ Erro ao processar agendamento: {str(e)}. Tente novamente com formato: 'Lembrar amanhã 8h colocar comida'"
 
                 elif intent == "consultar_agenda":
                     result = list_events_uc.execute(

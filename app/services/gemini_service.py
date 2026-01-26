@@ -41,10 +41,21 @@ class GeminiService:
    - analyze_project (Use SEMPRE que o usuário pedir para ler/resumir/analisar arquivos de uma pasta, mesmo que já tenha sido listada antes)
    - conversa
 3. IMPORTANTE para agendar/lembrete:
-   - Se o usuário pedir "lembrar", "lembrete", "lembre-me", "notificar" com data/hora, use intent: "agendar"
-   - Exemplos: "Lembrar amanhã 8h colocar comida", "Lembrete hoje 8:20", "Agendar amanhã 8h"
-   - Retorne campos: title (título do evento), start_iso (ISO 8601), end_iso (ISO 8601), description (opcional)
-3. IMPORTANTE para analyze_project:
+   - Se o usuário pedir "lembrar", "lembrete", "lembre-me", "notificar", "agendar" com data/hora, use intent: "agendar"
+   - Exemplos: "Lembrar amanhã 8h colocar comida", "Lembrete hoje 8:20", "Agendar amanhã 8h", "Lembrar de emitir nota fiscal amanhã as 10h"
+   - Retorne campos OBRIGATÓRIOS:
+     * title: Título do lembrete (extraia do texto, ex: "Emitir nota fiscal tafacil")
+     * start_iso: Data/hora em formato ISO 8601 com timezone (ex: "2026-01-27T10:00:00-03:00" para amanhã 10h)
+     * end_iso: Data/hora final (se não especificado, use 1 hora depois de start_iso)
+     * description: Descrição opcional
+   - REGRAS para start_iso:
+     * "amanhã 8h" ou "amanhã às 8h" -> data de amanhã às 08:00:00-03:00
+     * "hoje 8:20" ou "hoje às 8:20" -> data de hoje às 08:20:00-03:00
+     * "amanhã as 10h" -> data de amanhã às 10:00:00-03:00
+     * SEMPRE use timezone -03:00 (Brasil)
+     * SEMPRE use formato: YYYY-MM-DDTHH:MM:SS-03:00
+     * Use a data atual ({now.strftime('%Y-%m-%d')}) como referência para "hoje"
+4. IMPORTANTE para analyze_project:
    - Se o usuário pedir "resumo", "analise", "leia", "o que trata", "explique" sobre arquivos/pasta/documento
    - Use intent: "analyze_project" e campo "folder" com o nome da pasta (se mencionado) ou deixe vazio para usar a última pasta listada
    - Se o usuário mencionar um arquivo específico, inclua no campo "file" o nome do arquivo
@@ -87,9 +98,17 @@ USUÁRIO: "{user_prompt}"
             return data
         except json.JSONDecodeError as e:
             logger.error(f"IA retornou JSON inválido: {e}. Raw: {raw[:500] if raw else 'vazio'}")
+            # Tenta extrair informações mesmo com JSON inválido
+            if "lembrar" in text.lower() or "lembrete" in text.lower() or "agendar" in text.lower():
+                logger.warning("Tentando processar agendamento mesmo com JSON inválido")
+                return {"intent": "agendar", "title": text, "start_iso": "", "end_iso": "", "description": ""}
             return {"intent": "conversa", "response": "Desculpe, não consegui processar. Tente de novo."}
         except Exception as e:
             logger.error(f"Erro na IA: {e}", exc_info=True)
+            # Se o erro for relacionado a agendamento, tenta processar mesmo assim
+            if "lembrar" in text.lower() or "lembrete" in text.lower() or "agendar" in text.lower():
+                logger.warning("Tentando processar agendamento mesmo com erro na IA")
+                return {"intent": "agendar", "title": text, "start_iso": "", "end_iso": "", "description": ""}
             return {"intent": "conversa", "response": "Desculpe, tive um problema. Tente em instantes."}
     
     def generate_content(self, prompt: str) -> str:
