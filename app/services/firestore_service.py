@@ -181,3 +181,57 @@ class FirestoreService:
         
         docs = self.db.collection('chats').stream()
         return [doc.id for doc in docs]
+    
+    # --- CONTEXTO DE PASTA/ARQUIVO ---
+    def save_last_folder_context(self, chat_id: Any, folder_name: str, files: List[dict]):
+        """Salva contexto da última pasta listada"""
+        if not self.db:
+            logger.warning("Firestore não disponível para salvar contexto")
+            return
+        
+        chat_id_str = ensure_string_id(chat_id)
+        try:
+            # Converte files para formato serializável
+            files_data = []
+            for f in files:
+                files_data.append({
+                    'name': f.get('name', ''),
+                    'id': f.get('id', '')
+                })
+            
+            self.db.collection('chats').document(chat_id_str).set({
+                'last_folder_name': folder_name,
+                'last_folder_files': files_data,
+                'last_folder_timestamp': datetime.now()
+            }, merge=True)
+            
+            logger.info(f"Contexto salvo: pasta={folder_name}, arquivos={len(files_data)}")
+        except Exception as e:
+            logger.error(f"Erro ao salvar contexto: {e}", exc_info=True)
+    
+    def get_last_folder_context(self, chat_id: Any) -> Optional[dict]:
+        """Recupera contexto da última pasta listada"""
+        if not self.db:
+            return None
+        
+        chat_id_str = ensure_string_id(chat_id)
+        try:
+            doc = self.db.collection('chats').document(chat_id_str).get()
+            
+            if doc.exists:
+                data = doc.to_dict()
+                folder_name = data.get('last_folder_name')
+                files = data.get('last_folder_files', [])
+                
+                if folder_name and files:
+                    logger.info(f"Contexto recuperado: pasta={folder_name}, arquivos={len(files)}")
+                    return {
+                        'folder_name': folder_name,
+                        'files': files
+                    }
+            
+            logger.warning(f"Nenhum contexto encontrado para chat_id={chat_id_str}")
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao recuperar contexto: {e}", exc_info=True)
+            return None

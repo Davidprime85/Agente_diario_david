@@ -32,52 +32,72 @@ class DriveService:
     def search_folder(self, name_query: str) -> Optional[Dict]:
         """
         Busca pasta com case-insensitive contains.
+        Inclui pastas compartilhadas e do Meu Drive.
         """
         if not self.service:
             logger.error("Drive service não disponível - verifique credenciais")
             return None
         
-        # Limpa aspas para evitar erro de sintaxe
-        safe_name = name_query.replace("'", "")
+        # Limpa aspas e caracteres especiais para evitar erro de sintaxe
+        safe_name = name_query.replace("'", "").replace('"', '').strip()
         
         try:
-            # 1. Busca exata primeiro (mais rápido)
-            query_exact = (
-                f"mimeType='application/vnd.google-apps.folder' "
-                f"and name='{safe_name}' "
-                f"and trashed=false"
+            # Lista TODAS as pastas acessíveis (incluindo compartilhadas)
+            # Não filtra por nome primeiro, depois filtra no código
+            query_all_folders = (
+                "mimeType='application/vnd.google-apps.folder' "
+                "and trashed=false"
             )
             
-            result = (
-                self.service.files()
-                .list(q=query_exact, fields="files(id, name)")
-                .execute()
-            )
+            all_folders = []
+            page_token = None
             
-            folders = result.get('files', [])
-            if folders:
-                return folders[0]
+            # Busca paginada para pegar todas as pastas
+            while True:
+                result = (
+                    self.service.files()
+                    .list(
+                        q=query_all_folders,
+                        fields="nextPageToken, files(id, name, shared)",
+                        pageSize=100,
+                        pageToken=page_token
+                    )
+                    .execute()
+                )
+                
+                folders = result.get('files', [])
+                all_folders.extend(folders)
+                
+                page_token = result.get('nextPageToken')
+                if not page_token:
+                    break
             
-            # 2. Se não encontrou exato, busca com contains (case-insensitive)
-            query_contains = (
-                f"mimeType='application/vnd.google-apps.folder' "
-                f"and name contains '{safe_name}' "
-                f"and trashed=false"
-            )
+            logger.info(f"Total de pastas encontradas: {len(all_folders)}")
             
-            result = (
-                self.service.files()
-                .list(q=query_contains, fields="files(id, name)")
-                .execute()
-            )
+            # Normaliza o nome da busca (lowercase, sem espaços extras)
+            search_name_lower = safe_name.lower().strip()
             
-            folders = result.get('files', [])
-            if folders:
-                logger.info(f"Encontrada pasta: {folders[0]['name']} (busca por contains)")
-                return folders[0]
+            # 1. Busca exata (case-insensitive)
+            for folder in all_folders:
+                if folder['name'].lower().strip() == search_name_lower:
+                    logger.info(f"✅ Pasta encontrada (exata): {folder['name']} (ID: {folder['id']})")
+                    return folder
             
-            logger.warning(f"Nenhuma pasta encontrada com nome contendo '{safe_name}'")
+            # 2. Busca contains (case-insensitive)
+            for folder in all_folders:
+                if search_name_lower in folder['name'].lower():
+                    logger.info(f"✅ Pasta encontrada (contains): {folder['name']} (ID: {folder['id']})")
+                    return folder
+            
+            # 3. Debug: lista primeiras 10 pastas para diagnóstico
+            logger.warning(f"Nenhuma pasta encontrada com nome '{safe_name}'")
+            logger.info(f"Primeiras 10 pastas disponíveis:")
+            for folder in all_folders[:10]:
+                shared_status = "compartilhada" if folder.get('shared') else "minha"
+                logger.info(f"  - {folder['name']} ({shared_status})")
+            
             return None
+            
         except Exception as e:
             logger.error(f"Erro ao buscar pasta: {e}", exc_info=True)
             return None
@@ -105,9 +125,26 @@ class DriveService:
             return ""
         
         try:
+            # Google Docs/Sheets/Slides
             if "google-apps.document" in mime_type:
                 request = self.service.files().export_media(fileId=file_id, mimeType='text/plain')
+            elif "google-apps.spreadsheet" in mime_type:
+                request = self.service.files().export_media(fileId=file_id, mimeType='text/csv')
+            elif "google-apps.presentation" in mime_type:
+                request = self.service.files().export_media(fileId=file_id, mimeType='text/plain')
+            # PDFs - tenta exportar como texto
+            elif "pdf" in mime_type:
+                try:
+                    request = self.service.files().export_media(fileId=file_id, mimeType='text/plain')
+                except:
+                    # Se export falhar, tenta baixar direto
+                    request = self.service.files().get_media(fileId=file_id)
+            # Texto simples
+            elif "text" in mime_type or "plain" in mime_type:
+                request = self.service.files().get_media(fileId=file_id)
             else:
+                # Para outros tipos, tenta baixar direto
+                logger.warning(f"Tipo de arquivo não suportado diretamente: {mime_type}, tentando download direto")
                 request = self.service.files().get_media(fileId=file_id)
             
             file_handle = io.BytesIO()
@@ -119,7 +156,13 @@ class DriveService:
             
             # Decodifica com tratamento de erros
             content = file_handle.getvalue().decode('utf-8', errors='ignore')
+            
+            # Se o conteúdo parece binário ou vazio, retorna mensagem
+            if len(content.strip()) < 50:
+                logger.warning(f"Conteúdo extraído muito curto ({len(content)} chars), pode ser binário")
+                return ""
+            
             return content[:max_length]
         except Exception as e:
-            logger.error(f"Erro ao ler arquivo: {e}")
-            return f"[Erro ao ler arquivo: {str(e)}]"
+            logger.error(f"Erro ao ler arquivo {file_id}: {e}", exc_info=True)
+            return ""

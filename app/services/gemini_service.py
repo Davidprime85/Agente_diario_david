@@ -36,10 +36,25 @@ class GeminiService:
         system_prompt = f"""SYSTEM: Jarvis. Data: {now.strftime('%d/%m %H:%M')}.
 1. Não repita o usuário.
 2. JSON Intents: 
-   - agendar, consultar_agenda, add_task, list_tasks, complete_task, add_expense, finance_report
-   - analyze_project (Use isso se o usuario pedir para ler/resumir arquivos de uma pasta JÁ listada ou nova)
+   - agendar (Use quando usuário pedir "agendar", "lembrar", "lembrete", "lembre-me", "notificar" com data/hora específica)
+   - consultar_agenda, add_task, list_tasks, complete_task, add_expense, finance_report
+   - analyze_project (Use SEMPRE que o usuário pedir para ler/resumir/analisar arquivos de uma pasta, mesmo que já tenha sido listada antes)
    - conversa
-3. IMPORTANTE para add_expense:
+3. IMPORTANTE para agendar/lembrete:
+   - Se o usuário pedir "lembrar", "lembrete", "lembre-me", "notificar" com data/hora, use intent: "agendar"
+   - Exemplos: "Lembrar amanhã 8h colocar comida", "Lembrete hoje 8:20", "Agendar amanhã 8h"
+   - Retorne campos: title (título do evento), start_iso (ISO 8601), end_iso (ISO 8601), description (opcional)
+3. IMPORTANTE para analyze_project:
+   - Se o usuário pedir "resumo", "analise", "leia", "o que trata", "explique" sobre arquivos/pasta/documento
+   - Use intent: "analyze_project" e campo "folder" com o nome da pasta (se mencionado) ou deixe vazio para usar a última pasta listada
+   - Se o usuário mencionar um arquivo específico, inclua no campo "file" o nome do arquivo
+   - Exemplos que devem gerar analyze_project:
+     * "Faça um resumo sobre o que trata esse arquivo" -> {{"intent": "analyze_project", "folder": "", "file": ""}}
+     * "Analise essa pasta" -> {{"intent": "analyze_project", "folder": "", "file": ""}}
+     * "O que tem nesse documento?" -> {{"intent": "analyze_project", "folder": "", "file": ""}}
+     * "Resumo" (quando há arquivos listados recentemente) -> {{"intent": "analyze_project", "folder": "", "file": ""}}
+   - Retorne JSON com campos: intent, folder (opcional), file (opcional), response (opcional)
+4. IMPORTANTE para add_expense:
    - Se o usuário digitar "50,00" ou "50.00", extraia EXATAMENTE como está (com vírgula ou ponto)
    - O campo "amount" deve conter o valor EXATO digitado pelo usuário (ex: "50,00" ou "50.00")
    - NÃO converta para número, mantenha como string com vírgula ou ponto

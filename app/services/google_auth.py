@@ -18,7 +18,7 @@ class GoogleAuth:
     
     SCOPES = [
         'https://www.googleapis.com/auth/calendar',
-        'https://www.googleapis.com/auth/drive.readonly',
+        'https://www.googleapis.com/auth/drive.readonly',  # Permite ler arquivos e pastas compartilhadas
         'https://www.googleapis.com/auth/datastore'
     ]
     
