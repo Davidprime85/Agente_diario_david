@@ -199,55 +199,76 @@ class DriveService:
             
             if is_pdf and len(content_bytes) > 0:
                 logger.info(f"Tentando extrair texto de PDF ({len(content_bytes)} bytes)")
-                
-                # Tentativa 1: PyPDF2
-                try:
-                    import PyPDF2
-                    logger.info("Usando PyPDF2 para extrair texto...")
-                    pdf_reader = PyPDF2.PdfReader(io.BytesIO(content_bytes))
-                    text_content = ""
-                    
-                    # Tenta todas as páginas (não só 3)
-                    num_pages = len(pdf_reader.pages)
-                    logger.info(f"PDF tem {num_pages} páginas")
-                    
-                    for i, page in enumerate(pdf_reader.pages[:5]):  # Primeiras 5 páginas
-                        try:
-                            page_text = page.extract_text()
-                            if page_text:
-                                text_content += f"\n--- PÁGINA {i+1} ---\n{page_text}\n"
-                                logger.info(f"Extraído {len(page_text)} chars da página {i+1}")
-                        except Exception as e:
-                            logger.warning(f"Erro ao extrair página {i+1}: {e}")
-                            continue
-                    
-                    if text_content.strip():
-                        logger.info(f"✅ Sucesso! Texto extraído do PDF: {len(text_content)} chars total")
-                        return text_content[:max_length]
-                    else:
-                        logger.warning("PyPDF2 extraiu conteúdo vazio - PDF pode ser escaneado/imagem")
-                except ImportError:
-                    logger.warning("PyPDF2 não disponível - instale com: pip install PyPDF2")
-                except Exception as e:
-                    logger.error(f"PyPDF2 falhou: {e}", exc_info=True)
-                
-                # Tentativa 2: pdfplumber (se disponível)
+                # antigravity-awesome-skills/pdf-official: pdfplumber recomendado para texto e tabelas
+                buf = io.BytesIO(content_bytes)
+                text_content = ""
+
+                # 1) pdfplumber primeiro (melhor para texto e tabelas - SKILL pdf-official)
                 try:
                     import pdfplumber
-                    logger.info("Tentando pdfplumber como alternativa...")
-                    with pdfplumber.open(io.BytesIO(content_bytes)) as pdf:
-                        text_content = ""
+                    logger.info("Usando pdfplumber para extrair texto...")
+                    with pdfplumber.open(buf) as pdf:
                         for i, page in enumerate(pdf.pages[:5]):
                             page_text = page.extract_text()
                             if page_text:
                                 text_content += f"\n--- PÁGINA {i+1} ---\n{page_text}\n"
+                                logger.info(f"Extraído {len(page_text)} chars da página {i+1}")
+                            # Fallback: tenta tabelas se texto vazio (SKILL pdf-official)
+                            if not (page_text or "").strip():
+                                tables = page.extract_tables()
+                                for j, table in enumerate(tables):
+                                    if table:
+                                        text_content += f"\n--- PÁGINA {i+1} TABELA {j+1} ---\n"
+                                        text_content += "\n".join("\t".join(str(c or "") for c in row) for row in table) + "\n"
                         if text_content.strip():
                             logger.info(f"✅ Sucesso com pdfplumber: {len(text_content)} chars")
                             return text_content[:max_length]
                 except ImportError:
-                    pass  # pdfplumber não instalado, ok
+                    pass
                 except Exception as e:
                     logger.warning(f"pdfplumber falhou: {e}")
+
+                # 2) PyPDF2 como fallback
+                try:
+                    import PyPDF2
+                    logger.info("Usando PyPDF2 como fallback...")
+                    buf.seek(0)
+                    pdf_reader = PyPDF2.PdfReader(buf)
+                    text_content = ""
+                    for i, page in enumerate(pdf_reader.pages[:5]):
+                        try:
+                            page_text = page.extract_text()
+                            if page_text:
+                                text_content += f"\n--- PÁGINA {i+1} ---\n{page_text}\n"
+                        except Exception:
+                            continue
+                    if text_content.strip():
+                        logger.info(f"✅ Sucesso com PyPDF2: {len(text_content)} chars")
+                        return text_content[:max_length]
+                except ImportError:
+                    logger.warning("PyPDF2 não disponível - instale com: pip install PyPDF2")
+                except Exception as e:
+                    logger.warning(f"PyPDF2 falhou: {e}")
+
+                # 3) PDF escaneado: OCR com pdf2image + pytesseract (SKILL pdf-official "Extract Text from Scanned PDFs")
+                try:
+                    from pdf2image import convert_from_bytes
+                    import pytesseract
+                    logger.info("Tentando OCR (pdf2image + pytesseract)...")
+                    images = convert_from_bytes(content_bytes, first_page=1, last_page=5)
+                    text_content = ""
+                    for i, img in enumerate(images):
+                        page_text = (pytesseract.image_to_string(img, lang="por") or "").strip()
+                        if page_text:
+                            text_content += f"\n--- PÁGINA {i+1} (OCR) ---\n{page_text}\n"
+                    if text_content.strip():
+                        logger.info(f"✅ Sucesso com OCR: {len(text_content)} chars")
+                        return text_content[:max_length]
+                except ImportError as ie:
+                    logger.warning(f"OCR não disponível (pdf2image/pytesseract): {ie}")
+                except Exception as e:
+                    logger.warning(f"OCR falhou (Tesseract/poppler podem não estar instalados): {e}")
+                logger.warning("Texto vazio: PDF pode ser escaneado; OCR não extraiu texto.")
             
             # Decodificação padrão (só se não for PDF ou se PyPDF2/pdfplumber falharam)
             if not is_pdf:

@@ -10,3 +10,5 @@ google-api-python-client
 google-cloud-firestore
 PyPDF2
 pdfplumber
+pdf2image
+pytesseract

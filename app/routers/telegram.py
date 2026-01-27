@@ -1,16 +1,17 @@
 """
 Telegram Router - Webhook endpoint
+Boas práticas: antigravity-awesome-skills/telegram-bot-builder (ack imediato, typing, retry)
 """
 import logging
 import re
+import time
 import requests
 from fastapi import APIRouter, Request
 import google.generativeai as genai
 
 from app.services.firestore_service import FirestoreService
 from app.services.gemini_service import GeminiService
-from app.services.drive_service import DriveService  # Added import
-# TelegramService não usado diretamente aqui, usando requests diretamente
+from app.services.drive_service import DriveService
 from app.use_cases.create_task import CreateTaskUseCase
 from app.use_cases.list_tasks import ListTasksUseCase
 from app.use_cases.complete_task import CompleteTaskUseCase
@@ -23,6 +24,8 @@ from app.core.utils import ensure_string_id
 from app.core.config import TELEGRAM_TOKEN
 
 logger = logging.getLogger(__name__)
+SEND_RETRIES = 2
+SEND_RETRY_DELAY = 1.0
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
@@ -41,17 +44,35 @@ monthly_report_uc = MonthlyReportUseCase()
 analyze_file_uc = AnalyzeFileUseCase()
 
 
-def send_telegram_message(chat_id: str, text: str):
-    """Helper para enviar mensagem via Telegram"""
-    if TELEGRAM_TOKEN:
+def _send_telegram_api(chat_id: str, method: str, json_payload: dict) -> bool:
+    """Chama API do Telegram com retry e backoff."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    json_payload["chat_id"] = chat_id
+    for attempt in range(SEND_RETRIES + 1):
         try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=5
-            )
+            r = requests.post(url, json=json_payload, timeout=5)
+            if r.ok:
+                return True
+            logger.warning(f"Telegram API {method} status {r.status_code} attempt {attempt+1}")
         except Exception as e:
-            logger.error(f"Erro ao enviar mensagem: {e}")
+            logger.warning(f"Telegram API {method} attempt {attempt+1}: {e}")
+        if attempt < SEND_RETRIES:
+            time.sleep(SEND_RETRY_DELAY)
+    return False
+
+
+def send_chat_action_typing(chat_id: str):
+    """Envia ação 'typing' para feedback imediato."""
+    if TELEGRAM_TOKEN:
+        _send_telegram_api(chat_id, "sendChatAction", {"action": "typing"})
+
+
+def send_telegram_message(chat_id: str, text: str):
+    """Helper para enviar mensagem via Telegram com retry."""
+    if TELEGRAM_TOKEN:
+        ok = _send_telegram_api(chat_id, "sendMessage", {"text": text})
+        if not ok:
+            logger.error(f"Falha ao enviar mensagem para {chat_id} após retries")
 
 
 def send_inline_keyboard(chat_id: str, text: str):
@@ -67,19 +88,7 @@ def send_inline_keyboard(chat_id: str, text: str):
     }
     
     if TELEGRAM_TOKEN:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "reply_markup": keyboard,
-                    "parse_mode": "Markdown"
-                },
-                timeout=5
-            )
-        except Exception as e:
-            logger.error(f"Erro ao enviar teclado inline: {e}")
+        _send_telegram_api(chat_id, "sendMessage", {"text": text, "reply_markup": keyboard, "parse_mode": "Markdown"})
 
 
 def send_quick_reply(chat_id: str, text: str, options: list):
@@ -89,20 +98,8 @@ def send_quick_reply(chat_id: str, text: str, options: list):
         "resize_keyboard": True,
         "one_time_keyboard": True
     }
-    
     if TELEGRAM_TOKEN:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "reply_markup": keyboard
-                },
-                timeout=5
-            )
-        except Exception as e:
-            logger.error(f"Erro ao enviar quick reply: {e}")
+        _send_telegram_api(chat_id, "sendMessage", {"text": text, "reply_markup": keyboard})
 
 
 def download_voice(file_id: str) -> str:
@@ -150,6 +147,7 @@ async def webhook(request: Request):
             if callback_data in ["resumo", "analyze"]:
                 context = db.get_last_folder_context(chat_id)
                 if context:
+                    send_chat_action_typing(chat_id)
                     send_telegram_message(chat_id, f"📂 Analisando '{context['folder_name']}'...")
                     result = analyze_file_uc.execute(context['folder_name'])
                     if result["status"] == "ok":
@@ -216,6 +214,7 @@ async def webhook(request: Request):
                 return {"status": "ask_name"}
             
             folder_query = parts[1]
+            send_chat_action_typing(chat_id)
             send_telegram_message(chat_id, f"🔍 Procurando pasta '{folder_query}'...")
             
             # Executa o Use Case
@@ -336,6 +335,7 @@ async def webhook(request: Request):
                     
                     # Processa diretamente sem passar pela IA primeiro
                     folder_name = context['folder_name']
+                    send_chat_action_typing(chat_id)
                     if file_name:
                         send_telegram_message(chat_id, f"📄 Analisando arquivo '{file_name}'...")
                     else:
@@ -414,38 +414,51 @@ async def webhook(request: Request):
                             from datetime import datetime, timedelta, timezone
                             
                             text_lower = text.lower()
-                            # CORREÇÃO: Usa timezone do Brasil (-03:00) para cálculo correto de "amanhã"
-                            # Usa timezone fixo para evitar problemas com zoneinfo (pode não estar disponível)
-                            tz_brasil = timezone(timedelta(hours=-3))  # UTC-3 (Brasil)
+                            tz_brasil = timezone(timedelta(hours=-3))
                             now = datetime.now(tz_brasil)
                             
-                            # Extrai hora (suporta "8h", "8:00", "às 8h", "as 10h")
-                            hora_match = re.search(r'(?:às|as|)\s*(\d{1,2})[h:](\d{2})?', text_lower)
-                            hora = None
-                            minuto = 0
+                            # Data com ano: 27/01/2025, dia 27/01/2025, 27-01-2025
+                            data_match = re.search(r'(?:dia\s+)?(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})\b', text, re.I)
+                            if data_match:
+                                d, m, y = int(data_match.group(1)), int(data_match.group(2)), int(data_match.group(3))
+                                if y < 100:
+                                    y += 2000
+                                try:
+                                    target_date = datetime(y, m, d, 9, 0, 0, tzinfo=tz_brasil)
+                                    hora_match = re.search(r'(?:às|as|)\s*(\d{1,2})[h:](\d{2})?', text_lower)
+                                    if hora_match:
+                                        target_date = target_date.replace(hour=int(hora_match.group(1)), minute=int(hora_match.group(2) or 0), second=0, microsecond=0)
+                                    start_iso = target_date.isoformat()
+                                    logger.info(f"Data com ano extraída: {start_iso}")
+                                except ValueError:
+                                    pass
                             
-                            if hora_match:
-                                hora = int(hora_match.group(1))
-                                if hora_match.group(2):
-                                    minuto = int(hora_match.group(2))
-                            
-                            # Determina data (CORRIGIDO: usa timezone do Brasil)
-                            if "amanhã" in text_lower or "amanha" in text_lower:
-                                target_date = (now + timedelta(days=1)).replace(tzinfo=tz_brasil)
-                            elif "hoje" in text_lower:
-                                target_date = now
-                            else:
-                                target_date = (now + timedelta(days=1)).replace(tzinfo=tz_brasil)  # Default: amanhã
-                            
-                            if hora is not None:
-                                target_date = target_date.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+                            if not start_iso:
+                                hora_match = re.search(r'(?:às|as|)\s*(\d{1,2})[h:](\d{2})?', text_lower)
+                                hora, minuto = None, 0
+                                if hora_match:
+                                    hora = int(hora_match.group(1))
+                                    if hora_match.group(2):
+                                        minuto = int(hora_match.group(2))
+                                
+                                if "amanhã" in text_lower or "amanha" in text_lower:
+                                    target_date = (now + timedelta(days=1)).replace(tzinfo=tz_brasil)
+                                elif "hoje" in text_lower:
+                                    target_date = now
+                                else:
+                                    target_date = (now + timedelta(days=1)).replace(tzinfo=tz_brasil)
+                                
+                                if hora is not None:
+                                    target_date = target_date.replace(hour=hora, minute=minuto, second=0, microsecond=0)
                                 start_iso = target_date.isoformat()
-                                logger.info(f"Data/hora extraída do texto (BR): {start_iso} (hoje={now.date()}, amanhã={(now + timedelta(days=1)).date()})")
+                                logger.info(f"Data/hora extraída (BR): {start_iso}")
                         
                         if not title:
-                            # Tenta extrair título do texto
-                            # Remove palavras de tempo e mantém o resto
-                            title = re.sub(r'\b(lembrar|lembrete|lembre-me|agendar|amanhã|hoje|às|as|h|hora)\b', '', text, flags=re.IGNORECASE).strip()
+                            # Tenta extrair título do texto: remove palavras de tempo e datas
+                            title = re.sub(r'\b(lembrar|lembrete|lembre-me|agendar|amanhã|hoje|às|as|h|hora)\b', '', text, flags=re.IGNORECASE)
+                            title = re.sub(r'\bdia\s+\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', '', title, flags=re.I)
+                            title = re.sub(r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', '', title, flags=re.I)
+                            title = title.strip()
                             if not title:
                                 title = "Lembrete"
                         
@@ -493,15 +506,30 @@ async def webhook(request: Request):
                         response_text = f"❌ Erro ao processar agendamento: {str(e)}. Tente novamente com formato: 'Lembrar amanhã 8h colocar comida'"
 
                 elif intent == "consultar_agenda":
-                    result = list_events_uc.execute(
-                        time_min=ai_response.get("time_min", ""),
-                        time_max=ai_response.get("time_max", "")
-                    )
-                    if result["events"]:
-                        event_list = [e.get('summary', 'Sem título') for e in result["events"]]
-                        response_text = "📅 " + "\n".join(event_list)
-                    else:
-                        response_text = "📅 Vazia."
+                    from datetime import datetime, timedelta, timezone
+                    tz = timezone(timedelta(hours=-3))
+                    now = datetime.now(tz)
+                    time_min = (ai_response.get("time_min") or "").strip()
+                    time_max = (ai_response.get("time_max") or "").strip()
+                    text_lower = (text or "").lower()
+                    if not time_min or not time_max:
+                        if "amanhã" in text_lower or "amanha" in text_lower:
+                            d = (now + timedelta(days=1)).date()
+                        else:
+                            d = now.date()
+                        time_min = f"{d.isoformat()}T00:00:00-03:00"
+                        time_max = f"{d.isoformat()}T23:59:59-03:00"
+                        logger.info(f"consultar_agenda período: {time_min} a {time_max}")
+                    try:
+                        result = list_events_uc.execute(time_min=time_min, time_max=time_max)
+                        if result.get("events"):
+                            event_list = [e.get("summary", "Sem título") for e in result["events"]]
+                            response_text = "📅 " + "\n".join(event_list)
+                        else:
+                            response_text = "📅 Vazia."
+                    except Exception as ex:
+                        logger.error(f"Erro ao listar agenda: {ex}", exc_info=True)
+                        response_text = "❌ Não consegui acessar a agenda. Tente de novo."
 
                 elif intent == "add_task":
                     result = create_task_uc.execute(chat_id, ai_response.get("item", ""))
@@ -553,6 +581,7 @@ async def webhook(request: Request):
                                         break
                     
                     if folder_name:
+                        send_chat_action_typing(chat_id)
                         if file_name:
                             send_telegram_message(chat_id, f"📄 Analisando arquivo '{file_name}'...")
                         else:

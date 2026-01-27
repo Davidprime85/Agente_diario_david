@@ -224,10 +224,13 @@ class FirestoreService:
                 files = data.get('last_folder_files', [])
                 
                 if folder_name and files:
+                    ts = data.get('last_folder_timestamp')
                     logger.info(f"Contexto recuperado: pasta={folder_name}, arquivos={len(files)}")
+                    # agent-memory-systems: retorno inclui timestamp para recência/expiração
                     return {
                         'folder_name': folder_name,
-                        'files': files
+                        'files': files,
+                        'timestamp': ts
                     }
             
             logger.warning(f"Nenhum contexto encontrado para chat_id={chat_id_str}")

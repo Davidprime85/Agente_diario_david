@@ -32,48 +32,44 @@ class GeminiService:
         
         now = datetime.now()
         user_prompt = "[Audio]" if is_audio else text
-        
-        system_prompt = f"""SYSTEM: Jarvis. Data: {now.strftime('%d/%m %H:%M')}.
-1. Não repita o usuário.
-2. JSON Intents: 
-   - agendar (Use quando usuário pedir "agendar", "lembrar", "lembrete", "lembre-me", "notificar" com data/hora específica)
-   - consultar_agenda, add_task, list_tasks, complete_task, add_expense, finance_report
-   - analyze_project (Use SEMPRE que o usuário pedir para ler/resumir/analisar arquivos de uma pasta, mesmo que já tenha sido listada antes)
-   - conversa
-3. IMPORTANTE para agendar/lembrete:
-   - Se o usuário pedir "lembrar", "lembrete", "lembre-me", "notificar", "agendar" com data/hora, use intent: "agendar"
-   - Exemplos: "Lembrar amanhã 8h colocar comida", "Lembrete hoje 8:20", "Agendar amanhã 8h", "Lembrar de emitir nota fiscal amanhã as 10h"
-   - Retorne campos OBRIGATÓRIOS:
-     * title: Título do lembrete (extraia do texto, ex: "Emitir nota fiscal tafacil")
-     * start_iso: Data/hora em formato ISO 8601 com timezone (ex: "2026-01-27T10:00:00-03:00" para amanhã 10h)
-     * end_iso: Data/hora final (se não especificado, use 1 hora depois de start_iso)
-     * description: Descrição opcional
-   - REGRAS para start_iso:
-     * "amanhã 8h" ou "amanhã às 8h" -> data de amanhã às 08:00:00-03:00
-     * "hoje 8:20" ou "hoje às 8:20" -> data de hoje às 08:20:00-03:00
-     * "amanhã as 10h" -> data de amanhã às 10:00:00-03:00
-     * SEMPRE use timezone -03:00 (Brasil)
-     * SEMPRE use formato: YYYY-MM-DDTHH:MM:SS-03:00
-     * Use a data atual ({now.strftime('%Y-%m-%d')}) como referência para "hoje"
-4. IMPORTANTE para analyze_project:
-   - Se o usuário pedir "resumo", "analise", "leia", "o que trata", "explique" sobre arquivos/pasta/documento
-   - Use intent: "analyze_project" e campo "folder" com o nome da pasta (se mencionado) ou deixe vazio para usar a última pasta listada
-   - Se o usuário mencionar um arquivo específico, inclua no campo "file" o nome do arquivo
-   - Exemplos que devem gerar analyze_project:
-     * "Faça um resumo sobre o que trata esse arquivo" -> {{"intent": "analyze_project", "folder": "", "file": ""}}
-     * "Analise essa pasta" -> {{"intent": "analyze_project", "folder": "", "file": ""}}
-     * "O que tem nesse documento?" -> {{"intent": "analyze_project", "folder": "", "file": ""}}
-     * "Resumo" (quando há arquivos listados recentemente) -> {{"intent": "analyze_project", "folder": "", "file": ""}}
-   - Retorne JSON com campos: intent, folder (opcional), file (opcional), response (opcional)
-4. IMPORTANTE para add_expense:
-   - Moeda brasileira: "reais", "real", "R$", "RS" são todos equivalentes
-   - Se o usuário digitar "50 reais", "R$ 50,00", "50,00", "50.00", extraia o valor numérico
-   - O campo "amount" deve conter o valor EXATO digitado pelo usuário (ex: "50,00" ou "50.00")
-   - NÃO converta para número, mantenha como string com vírgula ou ponto
-   - Exemplos:
-     * "Adicione 20 reais de uber" -> {{"intent": "add_expense", "amount": "20,00", "item": "uber", "category": "transporte"}}
-     * "Gastei R$ 50,00 no almoço" -> {{"intent": "add_expense", "amount": "50,00", "item": "almoço", "category": "alimentação"}}
-     * "20 reais" -> {{"intent": "add_expense", "amount": "20,00", "item": "gasto", "category": "outros"}}
+        # prompt-engineer: Role, Context, Instructions, Constraints, Output format, Examples
+        system_prompt = f"""## Role
+Você é o Jarvis, assistente do Sistema Agente Diário. Responde em português e sempre em JSON.
+
+## Context
+Data/hora de referência: {now.strftime('%d/%m %H:%M')} ({now.strftime('%Y-%m-%d')}).
+
+## Instructions
+Responda com um único JSON contendo: intent, e os campos específicos de cada intent.
+Intents válidos: agendar, consultar_agenda, add_task, list_tasks, complete_task, add_expense, finance_report, analyze_project, conversa.
+
+- agendar: quando o usuário pedir "agendar", "lembrar", "lembrete", "lembre-me", "notificar" com data/hora.
+- consultar_agenda: "Consulte agenda", "O que tenho hoje?", "Qual compromisso amanhã?", "compromissos amanhã". Retorne time_min, time_max em ISO -03:00. Para "amanhã" use o dia seguinte 00:00–23:59; para "hoje" ou genérico use hoje 00:00–23:59.
+- analyze_project: quando pedir resumir/analisar/ler arquivos ou pasta (mesmo que já tenha listado).
+- add_expense: quando mencionar gasto, valor em reais, R$, despesa.
+
+Para agendar: retorne title, start_iso, end_iso, description.
+  start_iso/end_iso em ISO 8601 com -03:00 (Brasil). Ex: "2026-01-27T10:00:00-03:00".
+  "amanhã 8h" = amanhã 08:00-03:00; "hoje 8:20" = hoje 08:20-03:00.
+  Data com ano: "dia 27/01/2025", "27/01/2025" = 2025-01-27. Use o ano explícito quando o usuário informar.
+Para consultar_agenda: time_min e time_max (ex: "2026-01-27T00:00:00-03:00" e "2026-01-27T23:59:59-03:00" para um dia).
+Para add_expense: amount como string ("50,00" ou "50.00"), item, category. Moeda: reais/R$/real.
+Para analyze_project: folder (nome da pasta se mencionado, senão ""), file (nome do arquivo se mencionado, senão "").
+
+## Constraints (NÃO faça)
+- Não repita literalmente o texto do usuário na resposta.
+- Não invente datas nem use timezone diferente de -03:00.
+- Não converta amount para número; mantenha string com vírgula ou ponto.
+- Não use outro intent se o usuário claramente pediu lembrete/agendar ou análise de arquivo.
+
+## Output format
+JSON válido, sem markdown. Campos obrigatórios: intent. Demais conforme o intent.
+
+## Examples (few-shot)
+- "Lembrar amanhã 8h colocar comida" -> intent agendar, title "colocar comida", start_iso em ISO -03:00 para amanhã 08:00.
+- "Resumo desse arquivo" / "Analise essa pasta" -> {{"intent":"analyze_project","folder":"","file":""}}
+- "Gastei R$ 50 no almoço" -> {{"intent":"add_expense","amount":"50,00","item":"almoço","category":"alimentação"}}
+
 HISTÓRICO: {history_str}
 USUÁRIO: "{user_prompt}"
 """
@@ -93,27 +89,32 @@ USUÁRIO: "{user_prompt}"
             
             data = json.loads(raw)
             
-            # REGRA 4: Anti-Papagaio
+            # REGRA 4: Anti-Papagaio e resposta vaga
             if data.get("intent") == "conversa":
-                ai_response = data.get("response", "").strip().lower()
+                ai_response = data.get("response", "").strip()
+                ai_lower = ai_response.lower()
                 user_text_lower = (text or "").strip().lower()
                 if ai_response == user_text_lower or not ai_response:
                     data["response"] = "Entendi. Como posso ajudar?"
+                elif ai_lower in ("errr... como posso ajudar?", "errr... como posso ajudar", "como posso ajudar?") or (len(ai_response) < 25 and "ajudar" in ai_lower):
+                    data["response"] = "Não tenho informações sobre isso. Posso ajudar com: agenda, tarefas, gastos ou arquivos do Drive. O que você precisa?"
             
             return data
         except json.JSONDecodeError as e:
             logger.error(f"IA retornou JSON inválido: {e}. Raw: {raw[:500] if raw else 'vazio'}")
-            # Tenta extrair informações mesmo com JSON inválido
-            if "lembrar" in text.lower() or "lembrete" in text.lower() or "agendar" in text.lower():
-                logger.warning("Tentando processar agendamento mesmo com JSON inválido")
+            t = text.lower()
+            if "lembrar" in t or "lembrete" in t or "agendar" in t:
                 return {"intent": "agendar", "title": text, "start_iso": "", "end_iso": "", "description": ""}
+            if "agenda" in t or "compromisso" in t or ("o que tenho" in t and "amanhã" in t) or ("qual" in t and "amanhã" in t):
+                return {"intent": "consultar_agenda", "time_min": "", "time_max": ""}
             return {"intent": "conversa", "response": "Desculpe, não consegui processar. Tente de novo."}
         except Exception as e:
             logger.error(f"Erro na IA: {e}", exc_info=True)
-            # Se o erro for relacionado a agendamento, tenta processar mesmo assim
-            if "lembrar" in text.lower() or "lembrete" in text.lower() or "agendar" in text.lower():
-                logger.warning("Tentando processar agendamento mesmo com erro na IA")
+            t = text.lower()
+            if "lembrar" in t or "lembrete" in t or "agendar" in t:
                 return {"intent": "agendar", "title": text, "start_iso": "", "end_iso": "", "description": ""}
+            if "agenda" in t or "compromisso" in t or ("o que tenho" in t and "amanhã" in t) or ("qual" in t and "amanhã" in t):
+                return {"intent": "consultar_agenda", "time_min": "", "time_max": ""}
             return {"intent": "conversa", "response": "Desculpe, tive um problema. Tente em instantes."}
     
     def generate_content(self, prompt: str) -> str:
