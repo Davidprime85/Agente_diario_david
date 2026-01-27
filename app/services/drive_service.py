@@ -122,18 +122,41 @@ class DriveService:
     def read_file_content(self, file_id: str, mime_type: str, max_length: int = 4000) -> str:
         """Lê conteúdo de um arquivo (primeiros max_length chars)"""
         if not self.service:
+            logger.error("Drive service não disponível")
             return ""
         
+        logger.info(f"Tentando ler arquivo {file_id} (mimeType: {mime_type})")
+        
+        # Inicializa variáveis
+        actual_mime = mime_type
+        file_name = ""
+        
         try:
+            # Primeiro, tenta obter informações do arquivo para confirmar o tipo
+            try:
+                file_info = self.service.files().get(fileId=file_id, fields='name,mimeType').execute()
+                actual_mime = file_info.get('mimeType', mime_type)
+                file_name = file_info.get('name', '')
+                logger.info(f"Arquivo confirmado: {file_name} (mimeType real: {actual_mime})")
+                
+                # Se o nome termina em .pdf, força tratamento como PDF
+                if file_name.lower().endswith('.pdf'):
+                    actual_mime = 'application/pdf'
+                    logger.info(f"Forçando tratamento como PDF baseado no nome do arquivo")
+            except Exception as e:
+                logger.warning(f"Não consegui obter info do arquivo: {e}, usando mimeType fornecido")
+                actual_mime = mime_type
+                file_name = ""
+            
             # Google Docs/Sheets/Slides
-            if "google-apps.document" in mime_type:
+            if "google-apps.document" in actual_mime:
                 request = self.service.files().export_media(fileId=file_id, mimeType='text/plain')
-            elif "google-apps.spreadsheet" in mime_type:
+            elif "google-apps.spreadsheet" in actual_mime:
                 request = self.service.files().export_media(fileId=file_id, mimeType='text/csv')
-            elif "google-apps.presentation" in mime_type:
+            elif "google-apps.presentation" in actual_mime:
                 request = self.service.files().export_media(fileId=file_id, mimeType='text/plain')
             # PDFs - tenta múltiplas abordagens
-            elif "pdf" in mime_type or "application/pdf" in mime_type:
+            elif "pdf" in actual_mime.lower() or "application/pdf" in actual_mime:
                 # Abordagem 1: Tenta exportar como texto (funciona para PDFs com texto)
                 try:
                     logger.info(f"Tentando exportar PDF {file_id} como texto...")
@@ -170,38 +193,83 @@ class DriveService:
             content_bytes = file_handle.getvalue()
             
             # Para PDFs baixados diretamente, tenta extrair texto usando PyPDF2 se disponível
-            if "pdf" in mime_type and len(content_bytes) > 0:
+            # Verifica tanto o mime_type original quanto o actual_mime confirmado
+            is_pdf = ("pdf" in mime_type.lower() or "pdf" in actual_mime.lower() or 
+                     (file_name and file_name.lower().endswith('.pdf')))
+            
+            if is_pdf and len(content_bytes) > 0:
+                logger.info(f"Tentando extrair texto de PDF ({len(content_bytes)} bytes)")
+                
+                # Tentativa 1: PyPDF2
                 try:
                     import PyPDF2
-                    from io import BytesIO
-                    pdf_reader = PyPDF2.PdfReader(BytesIO(content_bytes))
+                    logger.info("Usando PyPDF2 para extrair texto...")
+                    pdf_reader = PyPDF2.PdfReader(io.BytesIO(content_bytes))
                     text_content = ""
-                    for page in pdf_reader.pages[:3]:  # Primeiras 3 páginas
-                        text_content += page.extract_text() + "\n"
+                    
+                    # Tenta todas as páginas (não só 3)
+                    num_pages = len(pdf_reader.pages)
+                    logger.info(f"PDF tem {num_pages} páginas")
+                    
+                    for i, page in enumerate(pdf_reader.pages[:5]):  # Primeiras 5 páginas
+                        try:
+                            page_text = page.extract_text()
+                            if page_text:
+                                text_content += f"\n--- PÁGINA {i+1} ---\n{page_text}\n"
+                                logger.info(f"Extraído {len(page_text)} chars da página {i+1}")
+                        except Exception as e:
+                            logger.warning(f"Erro ao extrair página {i+1}: {e}")
+                            continue
+                    
                     if text_content.strip():
-                        logger.info(f"Texto extraído do PDF usando PyPDF2: {len(text_content)} chars")
+                        logger.info(f"✅ Sucesso! Texto extraído do PDF: {len(text_content)} chars total")
                         return text_content[:max_length]
+                    else:
+                        logger.warning("PyPDF2 extraiu conteúdo vazio - PDF pode ser escaneado/imagem")
                 except ImportError:
-                    logger.warning("PyPDF2 não disponível, tentando decodificação direta")
+                    logger.warning("PyPDF2 não disponível - instale com: pip install PyPDF2")
                 except Exception as e:
-                    logger.warning(f"PyPDF2 falhou: {e}, tentando decodificação direta")
-            
-            # Decodificação padrão
-            try:
-                content = content_bytes.decode('utf-8', errors='ignore')
-            except:
-                # Tenta latin-1 se UTF-8 falhar
+                    logger.error(f"PyPDF2 falhou: {e}", exc_info=True)
+                
+                # Tentativa 2: pdfplumber (se disponível)
                 try:
-                    content = content_bytes.decode('latin-1', errors='ignore')
+                    import pdfplumber
+                    logger.info("Tentando pdfplumber como alternativa...")
+                    with pdfplumber.open(io.BytesIO(content_bytes)) as pdf:
+                        text_content = ""
+                        for i, page in enumerate(pdf.pages[:5]):
+                            page_text = page.extract_text()
+                            if page_text:
+                                text_content += f"\n--- PÁGINA {i+1} ---\n{page_text}\n"
+                        if text_content.strip():
+                            logger.info(f"✅ Sucesso com pdfplumber: {len(text_content)} chars")
+                            return text_content[:max_length]
+                except ImportError:
+                    pass  # pdfplumber não instalado, ok
+                except Exception as e:
+                    logger.warning(f"pdfplumber falhou: {e}")
+            
+            # Decodificação padrão (só se não for PDF ou se PyPDF2/pdfplumber falharam)
+            if not is_pdf:
+                try:
+                    content = content_bytes.decode('utf-8', errors='ignore')
                 except:
-                    content = ""
-            
-            # Se o conteúdo parece binário ou vazio, retorna mensagem
-            if len(content.strip()) < 50:
-                logger.warning(f"Conteúdo extraído muito curto ({len(content)} chars), pode ser binário ou PDF escaneado")
+                    # Tenta latin-1 se UTF-8 falhar
+                    try:
+                        content = content_bytes.decode('latin-1', errors='ignore')
+                    except:
+                        content = ""
+                
+                # Se o conteúdo parece binário ou vazio, retorna mensagem
+                if len(content.strip()) < 50:
+                    logger.warning(f"Conteúdo extraído muito curto ({len(content)} chars), pode ser binário")
+                    return ""
+                
+                return content[:max_length]
+            else:
+                # Se é PDF e chegou aqui, todas as tentativas falharam
+                logger.error(f"Não foi possível extrair texto do PDF usando nenhum método")
                 return ""
-            
-            return content[:max_length]
         except Exception as e:
             logger.error(f"Erro ao ler arquivo {file_id}: {e}", exc_info=True)
             return ""

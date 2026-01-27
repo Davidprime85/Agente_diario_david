@@ -9,4 +9,4 @@ google-auth-httplib2
 google-api-python-client
 google-cloud-firestore
 PyPDF2
-PyPDF2
+pdfplumber

@@ -77,9 +77,23 @@ class AnalyzeFileUseCase:
         
         if not txt_content:
             logger.warning("Nenhum conteúdo foi extraído dos arquivos")
+            
+            # Tenta usar o nome do arquivo e metadados para gerar um resumo básico
+            file_names = [f['name'] for f in files_to_analyze if f]
+            file_info = ", ".join(file_names)
+            
+            # Gera resumo baseado no nome do arquivo
+            prompt_fallback = (
+                f"O usuário pediu para analisar o arquivo '{file_info}' da pasta '{folder['name']}'.\n"
+                f"Infelizmente, não consegui extrair o conteúdo do arquivo (pode ser PDF escaneado, imagem ou formato não suportado).\n"
+                f"Com base apenas no nome do arquivo, faça uma análise do que provavelmente trata esse documento e explique que o conteúdo completo não pôde ser lido."
+            )
+            
+            summary_fallback = self.ai.generate_content(prompt_fallback)
+            
             return {
                 "status": "ok",
-                "summary": f"📄 Encontrei o arquivo mas não consegui extrair o conteúdo. O arquivo pode ser uma imagem, PDF complexo ou formato não suportado.",
+                "summary": f"📄 **Arquivo encontrado:** {file_info}\n\n{summary_fallback}\n\n⚠️ **Nota:** Não foi possível extrair o conteúdo completo. O arquivo pode ser um PDF escaneado (imagem) que requer OCR.",
                 "files": [{"name": f['name'], "id": f['id']} for f in files],
                 "folder_name": folder['name']
             }
