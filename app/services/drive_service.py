@@ -132,13 +132,25 @@ class DriveService:
                 request = self.service.files().export_media(fileId=file_id, mimeType='text/csv')
             elif "google-apps.presentation" in mime_type:
                 request = self.service.files().export_media(fileId=file_id, mimeType='text/plain')
-            # PDFs - tenta exportar como texto
-            elif "pdf" in mime_type:
+            # PDFs - tenta múltiplas abordagens
+            elif "pdf" in mime_type or "application/pdf" in mime_type:
+                # Abordagem 1: Tenta exportar como texto (funciona para PDFs com texto)
                 try:
+                    logger.info(f"Tentando exportar PDF {file_id} como texto...")
                     request = self.service.files().export_media(fileId=file_id, mimeType='text/plain')
-                except:
-                    # Se export falhar, tenta baixar direto
-                    request = self.service.files().get_media(fileId=file_id)
+                except Exception as e1:
+                    logger.warning(f"Export como texto falhou: {e1}, tentando HTML...")
+                    # Abordagem 2: Tenta exportar como HTML (pode ter mais sucesso)
+                    try:
+                        request = self.service.files().export_media(fileId=file_id, mimeType='text/html')
+                    except Exception as e2:
+                        logger.warning(f"Export como HTML falhou: {e2}, tentando download direto...")
+                        # Abordagem 3: Baixa o PDF direto (último recurso)
+                        try:
+                            request = self.service.files().get_media(fileId=file_id)
+                        except Exception as e3:
+                            logger.error(f"Todas as tentativas de ler PDF falharam: {e1}, {e2}, {e3}")
+                            return ""
             # Texto simples
             elif "text" in mime_type or "plain" in mime_type:
                 request = self.service.files().get_media(fileId=file_id)
@@ -155,11 +167,38 @@ class DriveService:
                 _, done = downloader.next_chunk()
             
             # Decodifica com tratamento de erros
-            content = file_handle.getvalue().decode('utf-8', errors='ignore')
+            content_bytes = file_handle.getvalue()
+            
+            # Para PDFs baixados diretamente, tenta extrair texto usando PyPDF2 se disponível
+            if "pdf" in mime_type and len(content_bytes) > 0:
+                try:
+                    import PyPDF2
+                    from io import BytesIO
+                    pdf_reader = PyPDF2.PdfReader(BytesIO(content_bytes))
+                    text_content = ""
+                    for page in pdf_reader.pages[:3]:  # Primeiras 3 páginas
+                        text_content += page.extract_text() + "\n"
+                    if text_content.strip():
+                        logger.info(f"Texto extraído do PDF usando PyPDF2: {len(text_content)} chars")
+                        return text_content[:max_length]
+                except ImportError:
+                    logger.warning("PyPDF2 não disponível, tentando decodificação direta")
+                except Exception as e:
+                    logger.warning(f"PyPDF2 falhou: {e}, tentando decodificação direta")
+            
+            # Decodificação padrão
+            try:
+                content = content_bytes.decode('utf-8', errors='ignore')
+            except:
+                # Tenta latin-1 se UTF-8 falhar
+                try:
+                    content = content_bytes.decode('latin-1', errors='ignore')
+                except:
+                    content = ""
             
             # Se o conteúdo parece binário ou vazio, retorna mensagem
             if len(content.strip()) < 50:
-                logger.warning(f"Conteúdo extraído muito curto ({len(content)} chars), pode ser binário")
+                logger.warning(f"Conteúdo extraído muito curto ({len(content)} chars), pode ser binário ou PDF escaneado")
                 return ""
             
             return content[:max_length]

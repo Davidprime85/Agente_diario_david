@@ -66,9 +66,14 @@ class GeminiService:
      * "Resumo" (quando há arquivos listados recentemente) -> {{"intent": "analyze_project", "folder": "", "file": ""}}
    - Retorne JSON com campos: intent, folder (opcional), file (opcional), response (opcional)
 4. IMPORTANTE para add_expense:
-   - Se o usuário digitar "50,00" ou "50.00", extraia EXATAMENTE como está (com vírgula ou ponto)
+   - Moeda brasileira: "reais", "real", "R$", "RS" são todos equivalentes
+   - Se o usuário digitar "50 reais", "R$ 50,00", "50,00", "50.00", extraia o valor numérico
    - O campo "amount" deve conter o valor EXATO digitado pelo usuário (ex: "50,00" ou "50.00")
    - NÃO converta para número, mantenha como string com vírgula ou ponto
+   - Exemplos:
+     * "Adicione 20 reais de uber" -> {{"intent": "add_expense", "amount": "20,00", "item": "uber", "category": "transporte"}}
+     * "Gastei R$ 50,00 no almoço" -> {{"intent": "add_expense", "amount": "50,00", "item": "almoço", "category": "alimentação"}}
+     * "20 reais" -> {{"intent": "add_expense", "amount": "20,00", "item": "gasto", "category": "outros"}}
 HISTÓRICO: {history_str}
 USUÁRIO: "{user_prompt}"
 """

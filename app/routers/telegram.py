@@ -54,6 +54,34 @@ def send_telegram_message(chat_id: str, text: str):
             logger.error(f"Erro ao enviar mensagem: {e}")
 
 
+def send_inline_keyboard(chat_id: str, text: str):
+    """Envia teclado inline com opções do menu"""
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "📅 Agenda", "callback_data": "menu_agenda"},
+            {"text": "✅ Tarefas", "callback_data": "menu_tasks"}
+        ], [
+            {"text": "💰 Financeiro", "callback_data": "menu_finance"},
+            {"text": "📂 Drive", "callback_data": "menu_drive"}
+        ]]
+    }
+    
+    if TELEGRAM_TOKEN:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_markup": keyboard,
+                    "parse_mode": "Markdown"
+                },
+                timeout=5
+            )
+        except Exception as e:
+            logger.error(f"Erro ao enviar teclado inline: {e}")
+
+
 def send_quick_reply(chat_id: str, text: str, options: list):
     """Envia mensagem com quick reply buttons"""
     keyboard = {
@@ -383,13 +411,16 @@ async def webhook(request: Request):
                         
                         # Fallback: se não tem start_iso, tenta extrair do texto original
                         if not start_iso:
-                            from datetime import datetime, timedelta
+                            from datetime import datetime, timedelta, timezone
                             
                             text_lower = text.lower()
-                            now = datetime.now()
+                            # CORREÇÃO: Usa timezone do Brasil (-03:00) para cálculo correto de "amanhã"
+                            # Usa timezone fixo para evitar problemas com zoneinfo (pode não estar disponível)
+                            tz_brasil = timezone(timedelta(hours=-3))  # UTC-3 (Brasil)
+                            now = datetime.now(tz_brasil)
                             
-                            # Extrai hora
-                            hora_match = re.search(r'(\d{1,2})[h:](\d{2})?', text_lower)
+                            # Extrai hora (suporta "8h", "8:00", "às 8h", "as 10h")
+                            hora_match = re.search(r'(?:às|as|)\s*(\d{1,2})[h:](\d{2})?', text_lower)
                             hora = None
                             minuto = 0
                             
@@ -398,17 +429,18 @@ async def webhook(request: Request):
                                 if hora_match.group(2):
                                     minuto = int(hora_match.group(2))
                             
-                            # Determina data
+                            # Determina data (CORRIGIDO: usa timezone do Brasil)
                             if "amanhã" in text_lower or "amanha" in text_lower:
-                                target_date = now + timedelta(days=1)
+                                target_date = (now + timedelta(days=1)).replace(tzinfo=tz_brasil)
                             elif "hoje" in text_lower:
                                 target_date = now
                             else:
-                                target_date = now + timedelta(days=1)  # Default: amanhã
+                                target_date = (now + timedelta(days=1)).replace(tzinfo=tz_brasil)  # Default: amanhã
                             
                             if hora is not None:
-                                start_iso = target_date.replace(hour=hora, minute=minuto, second=0, microsecond=0).isoformat() + "-03:00"
-                                logger.info(f"Data/hora extraída do texto: {start_iso}")
+                                target_date = target_date.replace(hour=hora, minute=minuto, second=0, microsecond=0)
+                                start_iso = target_date.isoformat()
+                                logger.info(f"Data/hora extraída do texto (BR): {start_iso} (hoje={now.date()}, amanhã={(now + timedelta(days=1)).date()})")
                         
                         if not title:
                             # Tenta extrair título do texto
