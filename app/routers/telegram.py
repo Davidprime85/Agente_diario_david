@@ -156,6 +156,29 @@ async def webhook(request: Request):
                         send_telegram_message(chat_id, result.get("summary", "Erro ao analisar."))
                 else:
                     send_telegram_message(chat_id, "📂 Use /pasta <nome> para listar arquivos primeiro.")
+            # Botões do menu principal: Financeiro, Agenda, Tarefas, Drive
+            elif callback_data == "menu_finance":
+                result = monthly_report_uc.execute(chat_id)
+                send_telegram_message(chat_id, result.get("formatted", "💸 Nada registrado."))
+            elif callback_data == "menu_agenda":
+                from datetime import datetime, timedelta, timezone
+                tz = timezone(timedelta(hours=-3))
+                now = datetime.now(tz)
+                time_min = f"{now.date().isoformat()}T00:00:00-03:00"
+                time_max = f"{now.date().isoformat()}T23:59:59-03:00"
+                try:
+                    r = list_events_uc.execute(time_min, time_max)
+                    if r.get("events"):
+                        send_telegram_message(chat_id, "📅 " + "\n".join(e.get("summary", "Sem título") for e in r["events"]))
+                    else:
+                        send_telegram_message(chat_id, "📅 Vazia.")
+                except Exception as e:
+                    logger.error(f"Erro agenda callback: {e}")
+                    send_telegram_message(chat_id, "❌ Não consegui acessar a agenda.")
+            elif callback_data == "menu_tasks":
+                send_telegram_message(chat_id, list_tasks_uc.execute(chat_id))
+            elif callback_data == "menu_drive":
+                send_telegram_message(chat_id, "📂 Use /pasta <nome da pasta> para listar arquivos do Drive. Ex: /pasta Projeto Beta")
             
             # Responde ao callback para remover o "loading" do botão
             if TELEGRAM_TOKEN:
@@ -205,6 +228,34 @@ async def webhook(request: Request):
             
             send_telegram_message(chat_id, resumo)
             return {"status": "resumo"}
+        
+        # Comandos do menu: /financeiro, /agenda, /tarefas, /drive (evita confusão com "pasta do Drive")
+        if text == "/financeiro":
+            result = monthly_report_uc.execute(chat_id)
+            send_telegram_message(chat_id, result.get("formatted", "💸 Nada registrado."))
+            return {"status": "financeiro"}
+        if text == "/agenda":
+            from datetime import datetime, timedelta, timezone
+            tz = timezone(timedelta(hours=-3))
+            now = datetime.now(tz)
+            time_min = f"{now.date().isoformat()}T00:00:00-03:00"
+            time_max = f"{now.date().isoformat()}T23:59:59-03:00"
+            try:
+                r = list_events_uc.execute(time_min, time_max)
+                if r.get("events"):
+                    send_telegram_message(chat_id, "📅 " + "\n".join(e.get("summary", "Sem título") for e in r["events"]))
+                else:
+                    send_telegram_message(chat_id, "📅 Vazia.")
+            except Exception as e:
+                logger.error(f"Erro /agenda: {e}")
+                send_telegram_message(chat_id, "❌ Não consegui acessar a agenda.")
+            return {"status": "agenda"}
+        if text == "/tarefas":
+            send_telegram_message(chat_id, list_tasks_uc.execute(chat_id))
+            return {"status": "tarefas"}
+        if text == "/drive":
+            send_telegram_message(chat_id, "📂 Use /pasta <nome da pasta> para listar arquivos do Drive. Ex: /pasta Projeto Beta")
+            return {"status": "drive"}
         
         # COMANDO PASTA COM DIAGNÓSTICO
         if text.startswith("/pasta") or text.startswith("/arquivos"):
